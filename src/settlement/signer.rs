@@ -185,7 +185,10 @@ fn compute_struct_hash(settlement: &Settlement) -> B256 {
     encoded
         .extend_from_slice(&FixedBytes::<32>::left_padding_from(&settlement.asset_id.to_be_bytes()).0);
     // uint48 tradeOfferId → uint256 (left-padded to 32 bytes)
-    // Stored as u64 in Rust but ABI-encoded as uint48 (Solidity casts to uint48)
+    // Stored as u64 in Rust but ABI-encoded as uint48 (Solidity casts to uint48).
+    // NOTE: Steam trade offer IDs are 64-bit but currently fit well within 48 bits
+    // (~10 trillion max observed). If Steam ever exceeds 2^48, both the contract
+    // (silent truncation in commitTradeOffer) and this encoding would need updating.
     encoded.extend_from_slice(
         &FixedBytes::<32>::left_padding_from(&settlement.trade_offer_id.to_be_bytes()).0,
     );

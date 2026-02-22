@@ -380,6 +380,8 @@ fn decide_community(
 
     // ④ Time check: must wait 24 hours from purchase before claiming abandonment
     // Trade may be invisible to buyer while seller confirms on mobile.
+    // Must match the on-chain abandonedWindow (default 24h, owner-adjustable 12h-72h).
+    // If the contract owner changes abandonedWindow, update this value to match.
     const ABANDONED_WINDOW_SECS: u64 = 24 * 60 * 60; // 24 hours
     let abandonment_deadline = escrow.purchase_time + ABANDONED_WINDOW_SECS;
 

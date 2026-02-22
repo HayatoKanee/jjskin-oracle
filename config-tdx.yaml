@@ -12,7 +12,7 @@ tls:
 oracle:
   # No signing key configured — key is generated inside the TDX VM at each boot.
   # The private key never leaves TDX encrypted memory.
-  contract_address: "0xe2286c2e6D274BeF900281Cd5802482D2360cf78"  # JJSKIN on Arbitrum Sepolia
+  contract_address: "0x90368508Bcd09444aD0d5E8dB258871324ecED75"  # JJSKIN on Arbitrum Sepolia
   chain_id: 421614  # Arbitrum Sepolia
   rpc_url: "https://sepolia-rollup.arbitrum.io/rpc"
   steam_factory_address: "0x627f747eb08442d0A61fC65093f21210142d013f"  # SteamAccountFactory on Arbitrum Sepolia

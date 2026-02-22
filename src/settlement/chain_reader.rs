@@ -115,7 +115,9 @@ impl ChainReader {
             return Err(eyre!("No listing exists for asset {}", asset_id));
         }
 
-        // Safe: uint56, uint48, uint40 always fit in u64
+        // Safe: uint56, uint48, uint40 always fit in u64.
+        // tradeOfferId is uint48 on-chain. Steam IDs are 64-bit but currently
+        // fit in 48 bits. If Steam exceeds 2^48, the contract needs updating.
         let price: u64 = listing.price.as_limbs()[0];
         let trade_offer_id: u64 = purchase.tradeOfferId.as_limbs()[0];
         let purchase_time: u64 = purchase.purchaseTime.as_limbs()[0];
