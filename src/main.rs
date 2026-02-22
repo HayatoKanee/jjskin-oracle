@@ -74,8 +74,30 @@ struct Args {
 #[derive(Debug, Deserialize)]
 struct SessionRequest {
     /// Asset ID for on-chain escrow lookup (required).
-    #[serde(rename = "assetId")]
+    /// Accepts both string and number to avoid JS precision loss for large IDs.
+    #[serde(rename = "assetId", deserialize_with = "deserialize_string_or_number")]
     asset_id: u64,
+}
+
+/// Deserialize a u64 from either a JSON string ("123") or number (123).
+/// Extension sends assetId as string to avoid JS float64 precision loss.
+fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(u64),
+    }
+
+    match StringOrNumber::deserialize(deserializer)? {
+        StringOrNumber::String(s) => s.parse().map_err(de::Error::custom),
+        StringOrNumber::Number(n) => Ok(n),
+    }
 }
 
 #[derive(Debug, Serialize)]
