@@ -1,6 +1,9 @@
 pub mod bot_pool;
 pub mod cache;
+pub mod classify;
+pub mod cs2_schema;
 pub mod gc_client;
+pub mod inventory;
 pub mod item_detail;
 pub mod link_parser;
 pub mod types;

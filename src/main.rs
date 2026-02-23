@@ -198,6 +198,24 @@ async fn main() -> eyre::Result<()> {
     // Wrap oracle signer in Arc for sharing between AppState and InspectState.
     let oracle_signer = Arc::new(oracle_signer);
 
+    // Load CS2 item schema (cases + keys) from CSGO-API at startup.
+    info!("Loading CS2 item schema from CSGO-API...");
+    let cs2_schema = inspect::cs2_schema::Cs2Schema::load()
+        .await
+        .expect("Failed to load CS2 schema — classify endpoints require it");
+    info!("CS2 schema ready: {} items", cs2_schema.len());
+
+    // Initialize classify state (independent of bot pool — no GC needed).
+    let classify_state = Arc::new(inspect::classify::ClassifyState {
+        schema: cs2_schema,
+        inventory: inspect::inventory::InventoryClient::new(),
+        signer: oracle_signer.clone(),
+        cache: inspect::cache::InspectCache::new(
+            10_000,
+            Duration::from_secs(300), // 5 min TTL (inventory changes on trade)
+        ),
+    });
+
     // Initialize CS2 inspect bot pool (if enabled).
     let inspect_enabled = config.inspect.enabled;
     let inspect_state: Option<Arc<inspect::InspectState>> = if inspect_enabled {
@@ -248,15 +266,23 @@ async fn main() -> eyre::Result<()> {
         .route("/proxy", get(proxy::proxy_ws_handler))
         .with_state(app_state);
 
+    // Classify routes (always available — no bot pool dependency).
+    let classify_routes = Router::new()
+        .route("/classify", post(inspect::classify::classify_handler))
+        .route("/classify/bulk", post(inspect::classify::bulk_classify_handler))
+        .with_state(classify_state);
+
     // Conditionally add inspect routes (separate state: Arc<InspectState>).
     let app = if let Some(inspect_state) = inspect_state {
         let inspect_routes = Router::new()
             .route("/", get(inspect::inspect_handler))
             .route("/bulk", post(inspect::bulk_handler))
             .with_state(inspect_state);
-        main_routes.nest("/inspect", inspect_routes)
-    } else {
         main_routes
+            .nest("/inspect", inspect_routes)
+            .nest("/inspect", classify_routes)
+    } else {
+        main_routes.nest("/inspect", classify_routes)
     };
 
     let app = app.layer(CorsLayer::permissive());
@@ -273,6 +299,8 @@ async fn main() -> eyre::Result<()> {
     info!("  POST /session             - Create session (assetId required)");
     info!("  GET  /notarize?sessionId= - WebSocket MPC-TLS + settlement");
     info!("  GET  /proxy?token=        - WebSocket-to-TCP proxy");
+    info!("  POST /inspect/classify    - Classify non-inspectable item (case/key)");
+    info!("  POST /inspect/classify/bulk - Classify batch (case/key)");
     if inspect_enabled {
         info!("  GET  /inspect?url=        - CS2 item inspection (single)");
         info!("  POST /inspect/bulk        - CS2 item inspection (batch)");
