@@ -42,6 +42,9 @@ sol! {
         uint32 reserved
     );
 
+    // JJSKIN.sol: uint256 public abandonedWindow (auto-generated getter)
+    function abandonedWindow() external view returns (uint256);
+
     // SteamAccountFactory.sol: getSteamIdByWallet(address) → uint256
     function getSteamIdByWallet(address wallet) external view returns (uint256 steamId);
 }
@@ -83,22 +86,28 @@ impl ChainReader {
     /// 1. JJSKIN.purchases(assetId) + JJSKIN.listings(assetId)  [parallel]
     /// 2. SteamAccountFactory.getSteamIdByWallet(seller) + ...(buyer)  [parallel]
     pub async fn read_escrow(&self, asset_id: u64) -> Result<EscrowSnapshot> {
-        // Batch 1: Read purchase and listing in parallel
+        // Batch 1: Read purchase, listing, and abandonedWindow in parallel
         let purchase_calldata = purchasesCall { assetId: asset_id }.abi_encode();
         let listing_calldata = listingsCall { assetId: asset_id }.abi_encode();
+        let abandoned_calldata = abandonedWindowCall {}.abi_encode();
 
-        let (purchase_result, listing_result) = tokio::join!(
+        let (purchase_result, listing_result, abandoned_result) = tokio::join!(
             self.eth_call(self.jjskin_address, &purchase_calldata),
             self.eth_call(self.jjskin_address, &listing_calldata),
+            self.eth_call(self.jjskin_address, &abandoned_calldata),
         );
 
         let purchase_bytes = purchase_result?;
         let listing_bytes = listing_result?;
+        let abandoned_bytes = abandoned_result?;
 
         let purchase = purchasesCall::abi_decode_returns(&purchase_bytes)
             .map_err(|e| eyre!("Failed to decode purchases({}): {e}", asset_id))?;
         let listing = listingsCall::abi_decode_returns(&listing_bytes)
             .map_err(|e| eyre!("Failed to decode listings({}): {e}", asset_id))?;
+        let abandoned_window_u256 = abandonedWindowCall::abi_decode_returns(&abandoned_bytes)
+            .map_err(|e| eyre!("Failed to decode abandonedWindow(): {e}"))?;
+        let abandoned_window: u64 = abandoned_window_u256.as_limbs()[0];
 
         // Validate purchase exists and is active
         if purchase.buyer == Address::ZERO {
@@ -178,6 +187,7 @@ impl ChainReader {
             buyer: purchase.buyer.0 .0,
             amount: price,
             purchase_time,
+            abandoned_window,
         })
     }
 

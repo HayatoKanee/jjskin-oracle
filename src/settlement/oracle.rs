@@ -242,6 +242,15 @@ fn decide_trade_offer(
 /// - status=4-9,11 → Refund(DeprecatedRollback) — deprecated rollback states
 /// - status=12 → Refund(TradeRollback) — current rollback state
 /// - Other → NonTerminalState error (includes 0,1,2,10 and unknown)
+/// NOTE: No tradeOfferId validation here (unlike decide_trade_offer).
+/// Steam asset IDs are unique and consumed on trade — once an item is traded,
+/// that asset ID no longer exists. A prover cannot reuse a past trade's
+/// GetTradeStatus to claim against a current escrow because:
+///   1. The asset_id in the past trade would not match the current escrow's asset_id
+///      (the item gets a new asset_id when received by the new owner)
+///   2. Even if somehow the same asset_id appeared in a past trade, the buyer
+///      would not have purchased it (the item wouldn't exist on the marketplace)
+/// The asset_id check alone is sufficient binding for GetTradeStatus.
 fn decide_trade_status(
     json: &str,
     escrow: &EscrowSnapshot,
@@ -378,12 +387,10 @@ fn decide_community(
         return Err(SettlementError::ParseFailed(ParseError::CommunityTradeExists));
     }
 
-    // ④ Time check: must wait 24 hours from purchase before claiming abandonment
+    // ④ Time check: must wait abandonedWindow from purchase before claiming abandonment
     // Trade may be invisible to buyer while seller confirms on mobile.
-    // Must match the on-chain abandonedWindow (default 24h, owner-adjustable 12h-72h).
-    // If the contract owner changes abandonedWindow, update this value to match.
-    const ABANDONED_WINDOW_SECS: u64 = 24 * 60 * 60; // 24 hours
-    let abandonment_deadline = escrow.purchase_time + ABANDONED_WINDOW_SECS;
+    // abandonedWindow is read from the JJSKIN contract (default 24h, owner-adjustable 12h-72h).
+    let abandonment_deadline = escrow.purchase_time + escrow.abandoned_window;
 
     if proof_timestamp < abandonment_deadline {
         return Err(SettlementError::TooEarlyForAbandonment {
@@ -417,6 +424,7 @@ mod tests {
             buyer: [0; 20],
             amount: 1000000,
             purchase_time: 1700000000,
+            abandoned_window: 24 * 60 * 60, // 24h default
         }
     }
 

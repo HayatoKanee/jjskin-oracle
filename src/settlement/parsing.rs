@@ -222,7 +222,12 @@ pub fn decompress_gzip(gzip_bytes: &[u8]) -> Result<Vec<u8>, ParseError> {
 // Steam JSON Parsing (serde_json)
 // ============================================================================
 
-/// Detect proof source from HTTP request URL
+/// Detect proof source from HTTP request URL.
+///
+/// Scans full request bytes (not just the URL line). This is safe because:
+/// 1. `server_name` cross-validation in `oracle::decide()` rejects mismatches
+///    (e.g. "GetTradeOffer" in a cookie on a community request)
+/// 2. Even if misclassified, the JSON parse step rejects wrong response structures
 pub fn detect_proof_source(request: &[u8]) -> Option<ProofSource> {
     if let Some(pos) = find_pattern(request, b"GetTrade") {
         let next_pos = pos + 8;
@@ -392,6 +397,9 @@ pub fn parse_community_html(
 
     let trade_not_found = is_error_page && has_not_found;
     if !trade_not_found {
+        // Covers both "trade exists" (normal page) and unrecognized responses
+        // (Steam outage, captcha, etc). Conservative: if we can't confirm the
+        // trade doesn't exist, don't sign a refund. Prover can retry later.
         return Err(ParseError::CommunityTradeExists);
     }
 
@@ -621,5 +629,49 @@ mod tests {
         assert_eq!(result.trade_offer_id, 8735365249);
         assert_eq!(result.prover_steam_id, 76561198366018280);
         assert!(result.trade_not_found);
+    }
+
+    #[test]
+    fn test_parse_community_html_trade_exists() {
+        // Normal trade page (trade exists) → refund rejected
+        let request = b"GET /tradeoffer/123 HTTP/1.1\r\nCookie: steamLoginSecure=76561198366018280%7C%7CeyToken";
+        let response = b"HTTP/1.1 200 OK\r\n\r\n<html><script>var g_steamID = '76561198366018280';</script><div>Trade Offer</div></html>";
+        let result = parse_community_html(request, response);
+        assert!(matches!(result, Err(ParseError::CommunityTradeExists)));
+    }
+
+    #[test]
+    fn test_parse_community_html_unrecognized_response_is_conservative() {
+        // Unrecognized response (Steam outage, captcha, etc.) → also rejects
+        // Conservative: "can't confirm trade doesn't exist → don't sign refund"
+        let request = b"GET /tradeoffer/123 HTTP/1.1\r\nCookie: steamLoginSecure=76561198366018280%7C%7CeyToken";
+        let response = b"HTTP/1.1 200 OK\r\n\r\n<html>Something unexpected</html>";
+        let result = parse_community_html(request, response);
+        assert!(matches!(result, Err(ParseError::CommunityTradeExists)));
+    }
+
+    #[test]
+    fn test_parse_community_html_sign_in_page() {
+        // Sign-in page = prover not logged in → MissingCookie
+        let request = b"GET /tradeoffer/123 HTTP/1.1\r\nCookie: steamLoginSecure=76561198366018280%7C%7CeyToken";
+        let response = b"HTTP/1.1 200 OK\r\n\r\n<html>Sign In</html>";
+        let result = parse_community_html(request, response);
+        assert!(matches!(result, Err(ParseError::MissingCookie)));
+    }
+
+    #[test]
+    fn test_detect_proof_source_pattern_in_cookie_still_detects() {
+        // "GetTradeOffer" in a cookie — detect_proof_source will find it.
+        // This is safe because oracle::decide() cross-validates server_name from TLS SNI.
+        let request = b"GET /some/other/endpoint HTTP/1.1\r\nCookie: ref=GetTradeOffer\r\n\r\n";
+        // Pattern found in cookie → classified as TradeOffer
+        assert_eq!(detect_proof_source(request), Some(ProofSource::TradeOffer));
+        // But oracle::decide() would reject this if server_name != "api.steampowered.com"
+    }
+
+    #[test]
+    fn test_detect_proof_source_no_match() {
+        let request = b"GET /some/random/path HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert_eq!(detect_proof_source(request), None);
     }
 }

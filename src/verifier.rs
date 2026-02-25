@@ -190,6 +190,10 @@ pub async fn handle_post_protocol<S: AsyncRead + AsyncWrite + Unpin>(
     );
 
     let t_decide = Instant::now();
+    // proof_timestamp from server wall clock, not MPC transcript.
+    // Accepted risk: in TDX VM with NTP, clock drift is <1s.
+    // Used for time_settlement comparison and 24h abandonment check —
+    // both have hour-scale margins, so sub-second drift is harmless.
     let proof_timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before UNIX epoch")

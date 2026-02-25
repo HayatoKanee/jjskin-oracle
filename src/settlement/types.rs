@@ -34,6 +34,8 @@ pub struct EscrowSnapshot {
     pub amount: u64,
     /// Purchase timestamp (from Purchase.purchaseTime, Unix seconds)
     pub purchase_time: u64,
+    /// Abandoned window in seconds (from JJSKIN.abandonedWindow, default 24h)
+    pub abandoned_window: u64,
 }
 
 // ============================================================================

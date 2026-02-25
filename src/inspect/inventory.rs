@@ -103,8 +103,16 @@ impl InventoryClient {
     ) -> Result<InventoryItem, InventoryError> {
         let asset_id_str = asset_id.to_string();
         let mut start_assetid: Option<String> = None;
+        const MAX_PAGES: usize = 20; // 20 * 5000 = 100,000 items max
+        let mut page = 0;
 
         loop {
+            page += 1;
+            if page > MAX_PAGES {
+                return Err(InventoryError::SteamApiError(
+                    "Inventory pagination exceeded limit".into(),
+                ));
+            }
             let mut url = format!(
                 "https://steamcommunity.com/inventory/{steam_id}/730/2?l=english&count=5000"
             );
@@ -203,8 +211,16 @@ impl InventoryClient {
     ) -> Result<Vec<InventoryItem>, InventoryError> {
         let mut all_items = Vec::new();
         let mut start_assetid: Option<String> = None;
+        const MAX_PAGES: usize = 20; // 20 * 5000 = 100,000 items max
+        let mut page = 0;
 
         loop {
+            page += 1;
+            if page > MAX_PAGES {
+                return Err(InventoryError::SteamApiError(
+                    "Inventory pagination exceeded limit".into(),
+                ));
+            }
             let mut url = format!(
                 "https://steamcommunity.com/inventory/{steam_id}/730/2?l=english&count=5000"
             );
@@ -250,7 +266,12 @@ impl InventoryClient {
 
             for asset in &inv.assets {
                 if let Some(desc) = desc_map.get(&(asset.classid.as_str(), asset.instanceid.as_str())) {
-                    let asset_id = asset.assetid.parse::<u64>().unwrap_or(0);
+                    let asset_id = asset.assetid.parse::<u64>().map_err(|_| {
+                        InventoryError::SteamApiError(format!(
+                            "Non-numeric assetid in Steam response: {:?}",
+                            asset.assetid
+                        ))
+                    })?;
                     all_items.push(InventoryItem {
                         asset_id,
                         classid: asset.classid.clone(),
@@ -400,5 +421,74 @@ mod tests {
         assert_eq!(inv.more_items, Some(1));
         assert_eq!(inv.last_assetid.as_deref(), Some("100"));
         assert_eq!(inv.total_inventory_count, 6000);
+    }
+
+    #[test]
+    fn test_non_numeric_assetid_is_rejected() {
+        // Steam assetids are always numeric. If not, the response is corrupted.
+        let json = r#"{
+            "assets": [
+                {"appid": 730, "contextid": "2", "assetid": "38988024803", "classid": "1", "instanceid": "0", "amount": "1"},
+                {"appid": 730, "contextid": "2", "assetid": "not_a_number", "classid": "1", "instanceid": "0", "amount": "1"}
+            ],
+            "descriptions": [{"appid": 730, "classid": "1", "instanceid": "0", "market_hash_name": "Test", "tradable": 1}],
+            "total_inventory_count": 2
+        }"#;
+
+        let inv: InventoryResponse = serde_json::from_str(json).unwrap();
+        let desc_map: HashMap<(&str, &str), &DescriptionEntry> = inv
+            .descriptions
+            .iter()
+            .map(|d| ((d.classid.as_str(), d.instanceid.as_str()), d))
+            .collect();
+
+        // Simulate what fetch_inventory does: parse assetid, reject on failure
+        let mut items = Vec::new();
+        let mut had_error = false;
+        for asset in &inv.assets {
+            if let Some(_desc) = desc_map.get(&(asset.classid.as_str(), asset.instanceid.as_str())) {
+                match asset.assetid.parse::<u64>() {
+                    Ok(asset_id) => items.push(asset_id),
+                    Err(_) => { had_error = true; break; }
+                }
+            }
+        }
+
+        // First asset parsed OK, second should fail
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0], 38988024803);
+        assert!(had_error, "Non-numeric assetid should trigger error");
+    }
+
+    #[test]
+    fn test_assetid_zero_is_valid_parse() {
+        // "0" is a valid u64 parse — shouldn't error.
+        // (Steam wouldn't use 0, but the parse itself is fine.)
+        assert_eq!("0".parse::<u64>().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_pagination_cursor_advances() {
+        // Verify pagination response has the cursor for next page
+        let page1 = r#"{
+            "assets": [{"appid": 730, "contextid": "2", "assetid": "100", "classid": "1", "instanceid": "0"}],
+            "descriptions": [{"appid": 730, "classid": "1", "instanceid": "0", "market_hash_name": "Item", "tradable": 1}],
+            "total_inventory_count": 10000,
+            "more_items": 1,
+            "last_assetid": "100"
+        }"#;
+        let page2 = r#"{
+            "assets": [{"appid": 730, "contextid": "2", "assetid": "200", "classid": "1", "instanceid": "0"}],
+            "descriptions": [{"appid": 730, "classid": "1", "instanceid": "0", "market_hash_name": "Item", "tradable": 1}],
+            "total_inventory_count": 10000
+        }"#;
+
+        let inv1: InventoryResponse = serde_json::from_str(page1).unwrap();
+        assert_eq!(inv1.more_items, Some(1));
+        assert_eq!(inv1.last_assetid.as_deref(), Some("100"));
+
+        let inv2: InventoryResponse = serde_json::from_str(page2).unwrap();
+        assert_eq!(inv2.more_items, None);
+        assert!(inv2.last_assetid.is_none());
     }
 }
