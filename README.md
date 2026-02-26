@@ -4,6 +4,16 @@ TDX oracle for the [JJSKIN](https://jjskin.com) CS2 skin marketplace. Runs MPC-T
 
 Built on [TLSNotary](https://github.com/tlsnotary/tlsn) `v0.1.0-alpha.14` and deployed via [dstack](https://github.com/aspect-build/dstack) (Phala Network).
 
+**Live deployment**: `https://3f351d27b464ed7779351cae4b7c548b0ee648c7-7047.dstack-pha-prod5.phala.network`
+
+**TDX attestation verified**: [proof.t16z.com/reports/f2f06952d3f4fcfc9fa304d20f9316ba230153f7cec028d2799b2f736dc74852](https://proof.t16z.com/reports/f2f06952d3f4fcfc9fa304d20f9316ba230153f7cec028d2799b2f736dc74852)
+
+| | |
+|---|---|
+| Oracle address | `0xC7F1AeE5C20871162d1B9E3BB5e0C2dA6674D843` |
+| JJSKIN contract | `0x966F2BBF404B36d6E30f226838e772AfcbE6Dcf7` |
+| Chain | Arbitrum One (42161) |
+
 ## How it works
 
 1. **MPC-TLS** — The oracle co-computes the TLS session with the prover (browser extension). Neither party sees the other's share of the key material.
@@ -101,7 +111,13 @@ Anyone can independently verify that the oracle is running the expected code ins
 
 **What Phala cannot do** (even if compromised): read the oracle's private key, forge attestation quotes, or change the code without changing MRTD.
 
-### 1. Get the attestation quote
+### Quick verification
+
+The current attestation report is already verified and publicly accessible:
+
+[**View verified attestation on proof.t16z.com**](https://proof.t16z.com/reports/f2f06952d3f4fcfc9fa304d20f9316ba230153f7cec028d2799b2f736dc74852)
+
+### 1. Get a fresh attestation quote
 
 ```bash
 curl -s https://3f351d27b464ed7779351cae4b7c548b0ee648c7-7047.dstack-pha-prod5.phala.network/attestation -o quote.bin
