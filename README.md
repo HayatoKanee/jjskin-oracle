@@ -67,12 +67,15 @@ The production image is published to Docker Hub:
 lumio1/jjskin-oracle
 ```
 
-The `docker-compose.yaml` in this repo pins the image by SHA256 digest. dstack hashes this file into RTMR[3], binding the exact image to the TDX attestation.
+The `docker-compose-mainnet.yaml` pins the image by SHA256 digest. dstack hashes this file into RTMR[3], binding the exact image to the TDX attestation.
 
-### Build from source
+### Reproducible build
+
+Base images are pinned to SHA256 digests in `Dockerfile.tdx` for reproducible MRTD measurements.
 
 ```bash
-docker build -t jjskin-oracle .
+GIT_HASH=$(git rev-parse --short HEAD)
+docker build --platform linux/amd64 -f Dockerfile.tdx --build-arg GIT_HASH=$GIT_HASH -t jjskin-oracle .
 ```
 
 ### Run locally (no TDX)
@@ -83,14 +86,25 @@ docker run -p 7047:7047 jjskin-oracle
 
 The `/attestation` endpoint returns 503 outside TDX. All other endpoints work normally.
 
-## Verify the oracle
+## Verify the oracle (TDX attestation)
 
-Anyone can verify that the oracle is running the expected code inside TDX:
+Anyone can independently verify that the oracle is running the expected code inside Intel TDX — no trust in the operator or Phala is required.
+
+### Trust model
+
+| Layer | Trust basis | What it proves |
+|-------|------------|----------------|
+| Intel TDX | Silicon | Private key never leaves encrypted memory; code can't be modified at runtime |
+| DCAP quote | Intel-signed | Exact binary (MRTD) and Docker image (RTMR[3]) running in the VM |
+| dstack | Phala runtime | Extends RTMR[3] with compose-hash; provides deterministic key derivation |
+| Reproducible build | Open source | Anyone can rebuild the Docker image and verify MRTD matches |
+
+**What Phala cannot do** (even if compromised): read the oracle's private key, forge attestation quotes, or change the code without changing MRTD.
 
 ### 1. Get the attestation quote
 
 ```bash
-curl -s https://<oracle-host>:7047/attestation -o quote.bin
+curl -s https://3f351d27b464ed7779351cae4b7c548b0ee648c7-7047.dstack-pha-prod5.phala.network/attestation -o quote.bin
 ```
 
 ### 2. Extract measurements
@@ -109,28 +123,53 @@ print(f'RTMR[3]: {rtmr3.hex()}')
 print(f'Oracle:  0x{oracle_addr.hex()}')
 ```
 
-### 3. Verify RTMR[3] matches docker-compose.yaml
+### 3. Verify the DCAP quote (off-chain)
+
+The quote is an Intel-signed attestation. Verify it using any of these tools:
+
+- **TEE Attestation Explorer**: [proof.t16z.com](https://proof.t16z.com) — paste the hex-encoded quote
+- **Phala Trust Center**: [trust.phala.com](https://trust.phala.com) — lookup by CVM app ID
+- **dcap-qvl** (Rust CLI): [github.com/aspect-build/dcap-qvl](https://github.com/aspect-build/dcap-qvl)
+- **@aspect-build/dstack-verifier** (TypeScript): [npmjs.com/package/@aspect-build/dstack-verifier](https://www.npmjs.com/package/@aspect-build/dstack-verifier)
+
+### 4. Verify the code matches (reproducible build)
 
 ```bash
-# The compose-hash is SHA256(docker-compose.yaml)
-sha256sum docker-compose.yaml
+# Rebuild the exact same image from source
+GIT_HASH=$(git rev-parse --short HEAD)
+docker build --platform linux/amd64 -f Dockerfile.tdx --build-arg GIT_HASH=$GIT_HASH -t jjskin-oracle .
 
-# dstack extends RTMR[3] with this hash at boot.
-# The on-chain verifier checks: keccak256(RTMR3_48_bytes)
+# The MRTD from your build should match the MRTD in the attestation quote.
+# Base images are pinned to SHA256 digests in Dockerfile.tdx for reproducibility.
 ```
 
-### 4. Verify on-chain
-
-The JJSKIN smart contract verifies the DCAP quote via Automata's on-chain verifier and checks:
-
-- **MRTD** matches the registered measurement (`keccak256(mrtd_48_bytes)`)
-- **RTMR[3]** matches the registered compose-hash (`keccak256(rtmr3_48_bytes)`)
-- **reportData[0:20]** is the oracle's Ethereum address (registered as authorized signer)
+### 5. Verify RTMR[3] matches docker-compose
 
 ```bash
-# Check if an oracle is registered
-cast call <JJSKIN_ADDRESS> "oracles(address)(bool)" <ORACLE_ADDRESS> --rpc-url <RPC>
+# dstack extends RTMR[3] with SHA384(compose-hash), where compose-hash = SHA256(docker-compose-mainnet.yaml)
+sha256sum docker-compose-mainnet.yaml
 ```
+
+### 6. Check on-chain registration
+
+```bash
+# Verify the oracle address is registered on the JJSKIN contract
+cast call 0x966F2BBF404B36d6E30f226838e772AfcbE6Dcf7 "oracles(address)(bool)" 0xC7F1AeE5C20871162d1B9E3BB5e0C2dA6674D843 --rpc-url https://arb1.arbitrum.io/rpc
+
+# Verify the expected MRTD measurement is set
+cast call 0x4D455ceA16E65c7566105caDEAd68851625BD8a9 "activeMeasurement()(bytes32)" --rpc-url https://arb1.arbitrum.io/rpc
+
+# Verify the expected RTMR[3] is set
+cast call 0x4D455ceA16E65c7566105caDEAd68851625BD8a9 "activeRtmr3()(bytes32)" --rpc-url https://arb1.arbitrum.io/rpc
+```
+
+The on-chain values should match `keccak256(mrtd_48_bytes)` and `keccak256(rtmr3_48_bytes)` from the attestation quote.
+
+### On-chain DCAP verification (future)
+
+The contract includes `registerOracle(bytes attestation)` for fully trustless on-chain DCAP verification via [Automata](https://ata.network). This requires Intel collateral to be registered on the Automata on-chain PCCS for Arbitrum One.
+
+**Upgrade path**: ZK-based DCAP verification via [Automata TDX Attestation SDK](https://github.com/aspect-build/tdx-attestation-sdk) (RISC Zero / SP1) will enable on-chain verification without collateral infrastructure.
 
 ## Configuration
 
