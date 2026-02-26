@@ -12,10 +12,10 @@ tls:
 oracle:
   # No signing key configured — key is generated inside the TDX VM at each boot.
   # The private key never leaves TDX encrypted memory.
-  contract_address: "0x93cdddfA3B3E9A27AF6C1956aD28e056E56bfF9b"  # JJSKIN on Arbitrum One
+  contract_address: "0x966F2BBF404B36d6E30f226838e772AfcbE6Dcf7"  # JJSKIN on Arbitrum One
   chain_id: 42161  # Arbitrum One
   rpc_url: "https://arb1.arbitrum.io/rpc"
-  steam_factory_address: "0xcd99F6C6C2f17B4118E2858aD3B5A1B748e17E4e"  # SteamAccountFactory on Arbitrum One
+  steam_factory_address: "0xF20d6e714cd03Dbc1f03A4c1117697cE60F55405"  # SteamAccountFactory on Arbitrum One
 
 inspect:
   enabled: true
