@@ -1,23 +1,35 @@
-# dstack TDX oracle image.
+# dstack TDX oracle image (reproducible build).
+#
+# Base images are pinned to SHA256 digests for reproducible MRTD measurement.
+# Anyone can rebuild from source and verify the image matches the on-chain measurement.
 #
 # Build:
-#   docker build -f Dockerfile.tdx -t tlsn-server-tdx .
+#   GIT_HASH=$(git rev-parse --short HEAD)
+#   docker build -f Dockerfile.tdx --build-arg GIT_HASH=$GIT_HASH -t lumio1/jjskin-oracle .
 #
 # Deploy via dstack with docker-compose.yaml (see docker-compose.yaml).
 # dstack provides /var/run/dstack.sock for attestation + key derivation.
 #
 # Secrets (bots.json) are mounted at runtime, NEVER baked into the image.
+#
+# To update base images: docker pull rust:bookworm && docker inspect --format='{{index .RepoDigests 0}}' rust:bookworm
 
-FROM rust:bookworm AS builder
+# --- Pinned base images (update digests when upgrading) ---
+# rust:bookworm (2026-02-26)
+FROM rust@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 RUN cargo build --release
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+# debian:bookworm-slim (2026-02-26)
+FROM debian@sha256:74d56e3931e0d5a1dd51f8c8a2466d21de84a271cd3b5a733b803aa91abf4421
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/target/release/tlsn-server .
-COPY config-tdx.yaml config.yaml
+ARG CONFIG=config-mainnet.yaml
+COPY ${CONFIG} config.yaml
+ARG GIT_HASH=dev
+ENV GIT_HASH=${GIT_HASH}
 EXPOSE 7047
 ENTRYPOINT ["./tlsn-server", "--config", "config.yaml"]

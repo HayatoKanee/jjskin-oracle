@@ -1,0 +1,19 @@
+# dstack compose file for TDX oracle — Arbitrum One (mainnet).
+#
+# The SHA256 of this file becomes the compose-hash, extended into RTMR[3].
+# Any change to this file (including image digest) produces a different RTMR[3],
+# which must be registered on-chain via setRtmr3().
+#
+# bots.json is runtime-mounted (NOT part of measurement).
+# config.yaml is baked into the image (IS part of measurement).
+
+services:
+  oracle:
+    image: lumio1/jjskin-oracle@sha256:2563bd25751d0a1fd37d4953ce5ba0155f7b66bb4741a602644245d62a028c6b
+    ports:
+      - "7047:7047"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock:ro
+      - /var/run/tappd.sock:/var/run/tappd.sock:ro
+    environment:
+      - RUST_LOG=info
