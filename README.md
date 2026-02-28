@@ -199,9 +199,9 @@ notarization:
   timeout: 120
 
 oracle:
-  contract_address: "0x..."
-  chain_id: 421614
-  rpc_url: "https://sepolia-rollup.arbitrum.io/rpc"
+  contract_address: "0x966F2BBF404B36d6E30f226838e772AfcbE6Dcf7"
+  chain_id: 42161
+  rpc_url: "https://arb1.arbitrum.io/rpc"
 
 inspect:
   bots_config_path: "bots.json"
