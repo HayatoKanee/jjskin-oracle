@@ -16,7 +16,7 @@ pub const STEAM64_OFFSET: u64 = 76561197960265728;
 ///
 /// Constructed by `ChainReader::read_escrow()` from trustless on-chain state.
 /// Extension only provides `assetId` as a lookup hint.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EscrowSnapshot {
     /// Steam asset ID being traded
     pub asset_id: u64,

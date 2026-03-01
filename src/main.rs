@@ -21,7 +21,7 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use axum_websocket::{WebSocket, WebSocketUpgrade};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -62,9 +62,24 @@ struct AppState {
 #[derive(Parser, Debug)]
 #[command(name = "tlsn-server", version, about = "TLSNotary Verifier + Oracle Server")]
 struct Args {
-    /// Path to the configuration YAML file.
-    #[arg(short, long, default_value = "config.yaml")]
-    config: String,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Start the server (default when no subcommand given).
+    Serve {
+        /// Path to the configuration YAML file.
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
+    },
+    /// Run oracle decide() on JSON from stdin (for e2e testing).
+    ///
+    /// Reads a JSON object from stdin with fields:
+    ///   server_name, sent_bytes_hex, recv_bytes_hex, escrow, proof_timestamp
+    /// Outputs JSON: { "ok": { ... } } or { "error": "..." }
+    TestDecide,
 }
 
 // ============================================================================
@@ -131,6 +146,72 @@ struct NotarizeQuery {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    let args = Args::parse();
+
+    // Default to Serve if no subcommand given (backwards compatible).
+    let command = args.command.unwrap_or(Command::Serve {
+        config: "config.yaml".to_string(),
+    });
+
+    match command {
+        Command::TestDecide => return run_test_decide(),
+        Command::Serve { config: config_path } => {
+            return run_serve(&config_path).await;
+        }
+    }
+}
+
+/// test-decide: read JSON from stdin, call decide(), output JSON to stdout.
+fn run_test_decide() -> eyre::Result<()> {
+    use settlement::oracle;
+
+    #[derive(serde::Deserialize)]
+    struct TestDecideInput {
+        server_name: String,
+        sent_bytes_hex: String,
+        recv_bytes_hex: String,
+        escrow: settlement::EscrowSnapshot,
+        proof_timestamp: u64,
+    }
+
+    let input: TestDecideInput = serde_json::from_reader(std::io::stdin())
+        .map_err(|e| eyre::eyre!("Failed to parse stdin JSON: {e}"))?;
+
+    let sent_bytes = hex::decode(&input.sent_bytes_hex)
+        .map_err(|e| eyre::eyre!("Invalid sent_bytes_hex: {e}"))?;
+    let recv_bytes = hex::decode(&input.recv_bytes_hex)
+        .map_err(|e| eyre::eyre!("Invalid recv_bytes_hex: {e}"))?;
+
+    let result = oracle::decide(
+        &input.server_name,
+        &sent_bytes,
+        &recv_bytes,
+        &input.escrow,
+        input.proof_timestamp,
+    );
+
+    match result {
+        Ok(settlement) => {
+            let output = serde_json::json!({
+                "ok": {
+                    "asset_id": settlement.asset_id,
+                    "trade_offer_id": settlement.trade_offer_id,
+                    "decision": settlement.decision as u8,
+                    "refund_reason": settlement.refund_reason as u8,
+                }
+            });
+            println!("{}", serde_json::to_string(&output)?);
+        }
+        Err(e) => {
+            let output = serde_json::json!({ "error": format!("{e}") });
+            println!("{}", serde_json::to_string(&output)?);
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_serve(config_path: &str) -> eyre::Result<()> {
     // Install ring crypto provider before any rustls usage
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -146,8 +227,7 @@ async fn main() -> eyre::Result<()> {
         .with_line_number(true)
         .init();
 
-    let args = Args::parse();
-    let config = Config::load(Path::new(&args.config));
+    let config = Config::load(Path::new(config_path));
 
     info!("Configuration loaded:");
     info!("  host: {}", config.host);
