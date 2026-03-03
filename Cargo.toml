@@ -94,3 +94,7 @@ tlsn-server-fixture-certs = { git = "https://github.com/tlsnotary/tlsn.git", tag
 tlsn-formats = { git = "https://github.com/tlsnotary/tlsn.git", tag = "v0.1.0-alpha.14" }
 http-body-util = "0.1"
 anyhow = "1.0"
+rcgen = "0.13"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+portpicker = "0.1"
