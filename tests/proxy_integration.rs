@@ -25,8 +25,6 @@ oracle:
   chain_id: 31337
   rpc_url: "http://127.0.0.1:1"
   steam_factory_address: "0x5FbDB2315678afecb367f032d93F642f64180aa3"
-inspect:
-  enabled: false
 "#
     );
     let config_path = std::env::temp_dir().join(format!("proxy-test-{port}.yaml"));

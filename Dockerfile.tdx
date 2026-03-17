@@ -19,6 +19,7 @@
 FROM rust@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+COPY buy-order-attestation-catalog.json ./
 COPY src/ src/
 RUN cargo build --release
 
@@ -32,4 +33,4 @@ COPY ${CONFIG} config.yaml
 ARG GIT_HASH=dev
 ENV GIT_HASH=${GIT_HASH}
 EXPOSE 7047
-ENTRYPOINT ["./tlsn-server", "--config", "config.yaml"]
+ENTRYPOINT ["./tlsn-server"]

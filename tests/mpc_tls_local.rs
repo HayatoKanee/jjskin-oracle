@@ -6,6 +6,9 @@
 //! NO production code is modified. All test code lives here in tests/.
 //! The verifier side calls oracle library functions directly (lib crate).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use rustls::crypto::CryptoProvider;
 use tlsn::{
@@ -44,20 +47,34 @@ const MAX_RECV_RECORDS: usize = 6;
 
 // Anvil account #0 private key (well-known, no secret)
 const TEST_ORACLE_KEY: &str =
-    "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const TEST_CONTRACT_ADDRESS: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const TEST_CHAIN_ID: u64 = 31337;
 
 /// Well-known default fixture output directory.
 /// Phase 5A reads from the same path.
 const DEFAULT_FIXTURE_DIR: &str = "/tmp/jjskin-settlement-fixtures";
+const TEST_SESSION_ID: &str = "mpc-tls-local-test";
+static TEST_KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn runtime_limits() -> verifier::MpcTlsRuntimeLimits {
+    verifier::MpcTlsRuntimeLimits {
+        max_sent_data: MAX_SENT_DATA,
+        max_recv_data: MAX_RECV_DATA,
+    }
+}
 
 // ============================================================================
 // Helper: create OracleSigner from temp file (no global env mutation)
 // ============================================================================
 
 fn default_oracle_config() -> OracleConfig {
-    let key_path = std::env::temp_dir().join("test-oracle-key.hex");
+    let key_file_id = TEST_KEY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let key_path = std::env::temp_dir().join(format!(
+        "test-oracle-key-{}-{}.hex",
+        std::process::id(),
+        key_file_id
+    ));
     std::fs::write(&key_path, TEST_ORACLE_KEY).unwrap();
 
     OracleConfig {
@@ -122,14 +139,26 @@ async fn run_mpc_tls_flow_with_host(
 
         // Run the real MPC-TLS verifier protocol
         let (mpc_result, mut socket) =
-            verifier::run_mpc_tls(verifier_socket.compat(), verifier_config)
+            verifier::run_mpc_tls(
+                TEST_SESSION_ID,
+                verifier_socket.compat(),
+                verifier_config,
+                runtime_limits(),
+                Duration::from_secs(120),
+            )
                 .await
                 .expect("run_mpc_tls failed");
 
         // Run the real settlement decision + EIP-712 signing
-        verifier::handle_post_protocol(&mpc_result, &mut socket, &escrow_clone, &verifier_signer)
-            .await
-            .expect("handle_post_protocol failed");
+        verifier::handle_post_protocol(
+            TEST_SESSION_ID,
+            &mpc_result,
+            &mut socket,
+            &escrow_clone,
+            &verifier_signer,
+        )
+        .await
+        .expect("handle_post_protocol failed");
     });
 
     // 4. Run prover side
@@ -478,8 +507,8 @@ async fn test_mpc_tls_wrong_ca_rejected() {
 
     // Verifier trusts server's CA (CA-A) — it will validate the server cert
     let verifier_ca = certs_for_server.ca_cert_der.clone();
-    let verifier_signer = create_test_signer().await;
-    let escrow_clone = escrow.clone();
+    let _verifier_signer = create_test_signer().await;
+    let _escrow_clone = escrow.clone();
 
     let verifier_task = tokio::spawn(async move {
         let verifier_config = VerifierConfig::builder()
@@ -489,7 +518,14 @@ async fn test_mpc_tls_wrong_ca_rejected() {
             .build()
             .unwrap();
 
-        let result = verifier::run_mpc_tls(verifier_socket.compat(), verifier_config).await;
+        let result = verifier::run_mpc_tls(
+            TEST_SESSION_ID,
+            verifier_socket.compat(),
+            verifier_config,
+            runtime_limits(),
+            Duration::from_secs(120),
+        )
+        .await;
         // The verifier may succeed or fail depending on when the error propagates.
         // What matters is the prover side fails.
         result

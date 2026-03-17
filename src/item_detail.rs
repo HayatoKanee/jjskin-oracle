@@ -14,6 +14,7 @@
 const FLOAT_PRECISION: f64 = 1_000_000.0;
 const MAX_DEFINDEX_STANDARD: u32 = 0x1FFF; // 8191
 const MAX_PAINTSEED: u32 = 1000;
+const MAX_PATTERN_TIER: u32 = 0x7;
 const MAX_TINT_ID: u32 = 0x1F; // 31
 const EXTENDED_MODE_PAINTSEED: u64 = 0x3FF; // 1023
 
@@ -26,15 +27,9 @@ fn encode_quality(steam_quality: u32) -> u32 {
     }
 }
 
-/// Encode CS2 item attributes into a packed uint64.
-///
-/// Auto-detects mode:
-/// - defindex > 8191 OR tint_id > 0 → extended mode (stickers, graffiti, agents)
-/// - otherwise → standard mode (weapons with float)
-///
-/// `quality` is the Steam raw value (4=Normal, 9=StatTrak, 12=Souvenir).
-/// `tint_id` is the graffiti color (0 for weapons).
-/// `pattern_tier` and `is_slab` are set to 0/false (oracle can't verify these).
+#[cfg(test)]
+/// Backwards-compatible wrapper for focused encoder tests that do not provide
+/// `pattern_tier` or `is_slab`.
 pub fn encode_item_detail(
     paintindex: u32,
     floatvalue: f32,
@@ -43,21 +38,44 @@ pub fn encode_item_detail(
     quality: u32,
     tint_id: u32,
 ) -> u64 {
+    encode_item_detail_with_flags(
+        paintindex, floatvalue, defindex, paintseed, quality, tint_id, 0, false,
+    )
+}
+
+/// Encode CS2 item attributes into a packed uint64.
+///
+/// Auto-detects mode:
+/// - defindex > 8191 OR tint_id > 0 → extended mode
+/// - otherwise → standard mode
+///
+/// `quality` is the Steam raw value (4=Normal, 9=StatTrak, 12=Souvenir).
+/// `tint_id` is the graffiti color (0 for weapons).
+pub fn encode_item_detail_with_flags(
+    paintindex: u32,
+    floatvalue: f32,
+    defindex: u32,
+    paintseed: u32,
+    quality: u32,
+    tint_id: u32,
+    pattern_tier: u32,
+    is_slab: bool,
+) -> u64 {
     let quality_encoded = encode_quality(quality) & 0x3;
     let use_extended = defindex > MAX_DEFINDEX_STANDARD || tint_id > 0;
 
     if use_extended {
-        // Extended mode: 28-bit defindex, tintId, quality
+        // Extended mode: 28-bit defindex, tintId, quality, and slab bit.
         let defindex_upper = ((defindex >> 13) & 0x7FFF) as u64;
         let defindex_lower = (defindex & 0x1FFF) as u64;
         let tint = (tint_id.min(MAX_TINT_ID) & 0x1F) as u64;
+        let slab = if is_slab { 1u64 } else { 0u64 };
 
         (tint << 43)
             | (defindex_upper << 28)
             | (defindex_lower << 15)
             | (EXTENDED_MODE_PAINTSEED << 5)
-            // bit 4: isSlab = 0 (oracle can't verify)
-            // bits 3-2: reserved = 0
+            | (slab << 4)
             | (quality_encoded as u64)
     } else {
         // Standard mode
@@ -66,14 +84,14 @@ pub fn encode_item_detail(
         let float_bits = float_scaled & 0xFFFFF;
         let def = (defindex as u64) & 0x1FFF;
         let seed = (paintseed.min(MAX_PAINTSEED) as u64) & 0x3FF;
-        // patternTier = 0 (oracle can't verify)
+        let pattern_bits = (pattern_tier.min(MAX_PATTERN_TIER) as u64) & 0x7;
         let quality_bits = quality_encoded as u64;
 
         (paint << 48)
             | (float_bits << 28)
             | (def << 15)
             | (seed << 5)
-            // bits 4-2: patternTier = 0
+            | (pattern_bits << 2)
             | quality_bits
     }
 }
@@ -118,6 +136,13 @@ mod tests {
     }
 
     #[test]
+    fn test_standard_mode_pattern_tier() {
+        let result = encode_item_detail_with_flags(44, 0.25, 7, 500, 4, 0, 3, false);
+        let pattern_tier = (result >> 2) & 0x7;
+        assert_eq!(pattern_tier, 3);
+    }
+
+    #[test]
     fn test_extended_mode_high_defindex() {
         // Sticker with defindex > 8191 → extended mode
         let result = encode_item_detail(0, 0.0, 10000, 0, 4, 0);
@@ -149,6 +174,23 @@ mod tests {
     }
 
     #[test]
+    fn test_extended_mode_sets_slab_flag_when_already_extended() {
+        let result = encode_item_detail_with_flags(0, 0.0, 10000, 0, 4, 0, 0, true);
+
+        let paintseed = (result >> 5) & 0x3FF;
+        let slab = (result >> 4) & 0x1;
+
+        assert_eq!(paintseed, EXTENDED_MODE_PAINTSEED);
+        assert_eq!(slab, 1);
+    }
+
+    #[test]
+    fn test_sticker_slab_low_defindex_matches_typescript_standard_mode() {
+        let result = encode_item_detail_with_flags(0, 0.0, 6026, 0, 4, 0, 0, true);
+        assert_eq!(result, 197459968);
+    }
+
+    #[test]
     fn test_cross_check_with_typescript() {
         // Cross-check: AK-47 Redline, float=0.5, defindex=7, seed=500, Normal
         // TypeScript: encodeItemDetail({paintindex:44, floatvalue:0.5, defindex:7, paintseed:500, patternTier:0, tintId:0, quality:0})
@@ -173,6 +215,13 @@ mod tests {
     }
 
     #[test]
+    fn test_gamma_doppler_cross_check_with_typescript() {
+        let result =
+            encode_item_detail_with_flags(1119, 0.06596978008747101_f32, 4, 135, 4, 0, 1, false);
+        assert_eq!(result, 314988207626391780);
+    }
+
+    #[test]
     fn test_float_precision() {
         // 0.123456 → 123456 (exact at 6 decimals)
         let result = encode_item_detail(1, 0.123456, 7, 0, 4, 0);
@@ -182,10 +231,10 @@ mod tests {
 
     #[test]
     fn test_quality_mapping() {
-        assert_eq!(encode_quality(4), 0);  // Normal
-        assert_eq!(encode_quality(9), 1);  // StatTrak
+        assert_eq!(encode_quality(4), 0); // Normal
+        assert_eq!(encode_quality(9), 1); // StatTrak
         assert_eq!(encode_quality(12), 2); // Souvenir
-        assert_eq!(encode_quality(0), 0);  // Unknown → Normal
+        assert_eq!(encode_quality(0), 0); // Unknown → Normal
         assert_eq!(encode_quality(99), 0); // Unknown → Normal
     }
 }

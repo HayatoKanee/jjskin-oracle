@@ -2,6 +2,8 @@ host: "0.0.0.0"
 port: 7047
 
 notarization:
+  max_pending_sessions: 100
+  max_active_sessions: 2
   max_sent_data: 2048
   max_recv_data: 4096
   timeout: 120
@@ -16,10 +18,3 @@ oracle:
   chain_id: 42161  # Arbitrum One
   rpc_url: "https://arb1.arbitrum.io/rpc"
   steam_factory_address: "0xF20d6e714cd03Dbc1f03A4c1117697cE60F55405"  # SteamAccountFactory on Arbitrum One
-
-inspect:
-  enabled: true
-  request_delay_ms: 1100    # Per-bot rate limit (Steam enforced)
-  request_timeout_s: 15     # Timeout for GC response
-  max_retries: 3
-  bots_config_path: "/app/bots.json"

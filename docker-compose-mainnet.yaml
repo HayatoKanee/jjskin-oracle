@@ -4,12 +4,15 @@
 # Any change to this file (including image digest) produces a different RTMR[3],
 # which must be registered on-chain via setRtmr3().
 #
-# bots.json is runtime-mounted (NOT part of measurement).
 # config.yaml is baked into the image (IS part of measurement).
+#
+# TODO: Add dstack-ingress sidecar for custom domain (oracle.jjskin.com)
+#       See: https://docs.phala.com/phala-cloud/networking/setup-custom-domain
+#       Requires: Cloudflare API token, CERTBOT_EMAIL, update RTMR[3] on DcapVerifier after deploy
 
 services:
   oracle:
-    image: lumio1/jjskin-oracle@sha256:2e83fb11d03e4680e36b9e8aa48f7d498ce8344e818511ea0f45feccb5b665e1
+    image: lumio1/jjskin-oracle@sha256:30bf4231e8612b22529dd6712749b9e477a42ae94e4035e035c3981441ed4376
     ports:
       - "7047:7047"
     volumes:

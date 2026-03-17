@@ -1,50 +1,125 @@
 mod attestation;
 mod axum_websocket;
 mod config;
-mod inspect;
+mod inventory_attestation;
+mod item_detail;
+mod observability;
 mod proxy;
 mod settlement;
+mod steam_inventory;
 mod verifier;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
 
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
 use axum_websocket::{WebSocket, WebSocketUpgrade};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 use ws_stream_tungstenite::WsStream;
 
 use tlsn::{config::verifier::VerifierConfig, webpki::RootCertStore};
 
 use config::Config;
+use observability::{
+    OracleRuntimeMetrics, current_loadavg_1m, current_process_cpu_sample, current_rss_bytes,
+    current_thread_count, process_cpu_percent,
+};
 use settlement::{ChainReader, OracleSigner};
+use verifier::{MpcTlsError, MpcTlsRuntimeLimits};
 
 // ============================================================================
 // Application State
 // ============================================================================
 
-/// Maximum concurrent sessions (prevents memory exhaustion DoS).
-const MAX_SESSIONS: usize = 100;
-
 /// Stored session data.
 struct SessionData {
     asset_id: u64,
+}
+
+#[derive(Default)]
+struct SessionCounters {
+    created: AtomicU64,
+    expired: AtomicU64,
+    upgraded: AtomicU64,
+    rejected_at_capacity: AtomicU64,
+}
+
+fn session_token_ttl(timeout_seconds: u64) -> Duration {
+    Duration::from_secs(timeout_seconds.saturating_add(30).max(30))
+}
+
+fn remaining_deadline(deadline: TokioInstant) -> Option<Duration> {
+    deadline.checked_duration_since(TokioInstant::now())
+}
+
+fn spawn_resource_heartbeat(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        let cpu_count = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1);
+        let mut previous_cpu_sample = current_process_cpu_sample();
+
+        loop {
+            interval.tick().await;
+
+            let pending_sessions = state.sessions.lock().await.len();
+            let current_cpu_sample = current_process_cpu_sample();
+            let process_cpu_pct = previous_cpu_sample
+                .zip(current_cpu_sample)
+                .and_then(|(previous, current)| process_cpu_percent(previous, current, cpu_count));
+            previous_cpu_sample = current_cpu_sample;
+
+            let rss_bytes = current_rss_bytes();
+            let loadavg_1m = current_loadavg_1m();
+            let thread_count = current_thread_count();
+
+            info!(
+                stage = "resource_heartbeat",
+                cpu_count,
+                pending_sessions,
+                active_notarizations = state.metrics.active_notarizations(),
+                available_active_permits = state.active_notarization_permits.available_permits(),
+                sessions_created = state.session_counters.created.load(Ordering::Relaxed),
+                sessions_expired = state.session_counters.expired.load(Ordering::Relaxed),
+                sessions_upgraded = state.session_counters.upgraded.load(Ordering::Relaxed),
+                sessions_rejected_at_capacity = state
+                    .session_counters
+                    .rejected_at_capacity
+                    .load(Ordering::Relaxed),
+                inventory_cache_hits = state.metrics.inventory_attestation_cache_hits(),
+                inventory_cache_misses = state.metrics.inventory_attestation_cache_misses(),
+                mpc_tls_timeouts = state.metrics.mpc_tls_timeouts(),
+                rss_bytes = rss_bytes.unwrap_or_default(),
+                rss_available = rss_bytes.is_some(),
+                process_cpu_pct = process_cpu_pct.unwrap_or_default(),
+                process_cpu_available = process_cpu_pct.is_some(),
+                loadavg_1m = loadavg_1m.unwrap_or_default(),
+                loadavg_available = loadavg_1m.is_some(),
+                thread_count = thread_count.unwrap_or_default(),
+                thread_count_available = thread_count.is_some(),
+                "Oracle resource heartbeat"
+            );
+        }
+    });
 }
 
 /// Shared application state.
@@ -53,6 +128,9 @@ struct AppState {
     config: Config,
     oracle_signer: Arc<OracleSigner>,
     chain_reader: ChainReader,
+    metrics: Arc<OracleRuntimeMetrics>,
+    active_notarization_permits: Arc<Semaphore>,
+    session_counters: SessionCounters,
 }
 
 // ============================================================================
@@ -60,7 +138,11 @@ struct AppState {
 // ============================================================================
 
 #[derive(Parser, Debug)]
-#[command(name = "tlsn-server", version, about = "TLSNotary Verifier + Oracle Server")]
+#[command(
+    name = "tlsn-server",
+    version,
+    about = "TLSNotary Verifier + Oracle Server"
+)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
@@ -155,7 +237,9 @@ async fn main() -> eyre::Result<()> {
 
     match command {
         Command::TestDecide => return run_test_decide(),
-        Command::Serve { config: config_path } => {
+        Command::Serve {
+            config: config_path,
+        } => {
             return run_serve(&config_path).await;
         }
     }
@@ -234,6 +318,14 @@ async fn run_serve(config_path: &str) -> eyre::Result<()> {
     info!("  port: {}", config.port);
     info!("  max_sent_data: {}", config.notarization.max_sent_data);
     info!("  max_recv_data: {}", config.notarization.max_recv_data);
+    info!(
+        "  max_pending_sessions: {}",
+        config.notarization.max_pending_sessions
+    );
+    info!(
+        "  max_active_sessions: {}",
+        config.notarization.max_active_sessions
+    );
     info!("  timeout: {}s", config.notarization.timeout);
 
     // Validate contract addresses are configured (zero-address = silent settlement failure).
@@ -275,53 +367,22 @@ async fn run_serve(config_path: &str) -> eyre::Result<()> {
     // Bind oracle address for TDX attestation (no-op outside TDX).
     attestation::bind_oracle_address(oracle_signer.address());
 
-    // Wrap oracle signer in Arc for sharing between AppState and InspectState.
+    // Wrap oracle signer in Arc for sharing between AppState and inventory attestation state.
     let oracle_signer = Arc::new(oracle_signer);
+    let metrics = Arc::new(OracleRuntimeMetrics::default());
+    let active_notarization_permits =
+        Arc::new(Semaphore::new(config.notarization.max_active_sessions));
 
-    // Load CS2 item schema (cases + keys) from CSGO-API at startup.
-    info!("Loading CS2 item schema from CSGO-API...");
-    let cs2_schema = inspect::cs2_schema::Cs2Schema::load()
-        .await
-        .expect("Failed to load CS2 schema — classify endpoints require it");
-    info!("CS2 schema ready: {} items", cs2_schema.len());
-
-    // Initialize classify state (independent of bot pool — no GC needed).
-    let classify_state = Arc::new(inspect::classify::ClassifyState {
-        schema: cs2_schema,
-        inventory: inspect::inventory::InventoryClient::new(),
+    let inventory_attestation_state = Arc::new(inventory_attestation::InventoryAttestationState {
+        inventory: steam_inventory::InventoryClient::new(),
+        resolver: inventory_attestation::catalog::CatalogResolver::load()?,
         signer: oracle_signer.clone(),
-        cache: inspect::cache::InspectCache::new(
-            10_000,
-            Duration::from_secs(300), // 5 min TTL (inventory changes on trade)
+        cache: inventory_attestation::cache::InventoryAttestationCache::new(
+            inventory_attestation::DEFAULT_CACHE_CAPACITY,
+            Duration::from_secs(inventory_attestation::DEFAULT_CACHE_TTL_SECONDS),
         ),
+        metrics: metrics.clone(),
     });
-
-    // Initialize CS2 inspect bot pool (if enabled).
-    let inspect_enabled = config.inspect.enabled;
-    let inspect_state: Option<Arc<inspect::InspectState>> = if inspect_enabled {
-        info!("Inspect module enabled, initializing bot pool...");
-        match inspect::bot_pool::BotPool::new(&config.inspect).await {
-            Ok(pool) => {
-                let cache = inspect::cache::InspectCache::new(
-                    100_000,
-                    Duration::from_secs(3600),
-                );
-                info!("Bot pool ready: {} bots, inspect cache: 100k cap / 1h TTL", pool.bot_count());
-                Some(Arc::new(inspect::InspectState {
-                    pool,
-                    signer: oracle_signer.clone(),
-                    cache,
-                }))
-            }
-            Err(e) => {
-                error!("Failed to initialize bot pool: {} — inspect disabled", e);
-                None
-            }
-        }
-    } else {
-        info!("Inspect module disabled");
-        None
-    };
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
@@ -334,7 +395,16 @@ async fn run_serve(config_path: &str) -> eyre::Result<()> {
         config,
         oracle_signer,
         chain_reader,
+        metrics,
+        active_notarization_permits,
+        session_counters: SessionCounters::default(),
     });
+
+    spawn_resource_heartbeat(app_state.clone());
+
+    let inventory_attestation_routes = Router::new()
+        .route("/attest", post(inventory_attestation::attest_handler))
+        .with_state(inventory_attestation_state);
 
     // Build main routes (oracle / MPC-TLS).
     let main_routes = Router::new()
@@ -344,28 +414,10 @@ async fn run_serve(config_path: &str) -> eyre::Result<()> {
         .route("/session", post(session_handler))
         .route("/notarize", get(notarize_ws_handler))
         .route("/proxy", get(proxy::proxy_ws_handler))
+        .nest("/inventory", inventory_attestation_routes)
         .with_state(app_state);
 
-    // Classify routes (always available — no bot pool dependency).
-    let classify_routes = Router::new()
-        .route("/classify", post(inspect::classify::classify_handler))
-        .route("/classify/bulk", post(inspect::classify::bulk_classify_handler))
-        .with_state(classify_state);
-
-    // Conditionally add inspect routes (separate state: Arc<InspectState>).
-    let app = if let Some(inspect_state) = inspect_state {
-        let inspect_routes = Router::new()
-            .route("/", get(inspect::inspect_handler))
-            .route("/bulk", post(inspect::bulk_handler))
-            .with_state(inspect_state);
-        main_routes
-            .nest("/inspect", inspect_routes)
-            .nest("/inspect", classify_routes)
-    } else {
-        main_routes.nest("/inspect", classify_routes)
-    };
-
-    let app = app.layer(CorsLayer::permissive());
+    let app = main_routes.layer(CorsLayer::permissive());
 
     let tls_enabled = tls_config.enabled;
     info!(
@@ -379,12 +431,7 @@ async fn run_serve(config_path: &str) -> eyre::Result<()> {
     info!("  POST /session             - Create session (assetId required)");
     info!("  GET  /notarize?sessionId= - WebSocket MPC-TLS + settlement");
     info!("  GET  /proxy?token=        - WebSocket-to-TCP proxy");
-    info!("  POST /inspect/classify    - Classify non-inspectable item (case/key)");
-    info!("  POST /inspect/classify/bulk - Classify batch (case/key)");
-    if inspect_enabled {
-        info!("  GET  /inspect?url=        - CS2 item inspection (single)");
-        info!("  POST /inspect/bulk        - CS2 item inspection (batch)");
-    }
+    info!("  POST /inventory/attest    - Inventory-backed item attestation");
 
     if tls_enabled {
         let cert_path = tls_config
@@ -428,7 +475,11 @@ async fn info_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         git_hash,
         oracle_address: format!("{}", state.oracle_signer.address()),
         tdx_enabled: tdx_available,
-        tdx_backend: if tdx_available { "Dstack".to_string() } else { "None".to_string() },
+        tdx_backend: if tdx_available {
+            "Dstack".to_string()
+        } else {
+            "None".to_string()
+        },
     })
 }
 
@@ -442,12 +493,32 @@ async fn session_handler(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // Atomic check-and-insert under a single lock to prevent TOCTOU race.
     let session_id = Uuid::new_v4().to_string();
-    {
+    let pending_sessions = {
         let mut sessions = state.sessions.lock().await;
-        if sessions.len() >= MAX_SESSIONS {
+        if sessions.len() >= state.config.notarization.max_pending_sessions {
+            let rejected_at_capacity = state
+                .session_counters
+                .rejected_at_capacity
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            let rss_bytes = current_rss_bytes();
+            warn!(
+                session_id,
+                asset_id = body.asset_id,
+                pending_sessions = sessions.len(),
+                active_notarizations = state.metrics.active_notarizations(),
+                available_active_permits = state.active_notarization_permits.available_permits(),
+                rejected_at_capacity,
+                rss_bytes = rss_bytes.unwrap_or_default(),
+                rss_available = rss_bytes.is_some(),
+                "Rejected session at pending-session capacity"
+            );
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
-                format!("Server at capacity ({MAX_SESSIONS} concurrent sessions)"),
+                format!(
+                    "Server at pending-session capacity ({})",
+                    state.config.notarization.max_pending_sessions
+                ),
             ));
         }
         sessions.insert(
@@ -456,22 +527,51 @@ async fn session_handler(
                 asset_id: body.asset_id,
             },
         );
-    }
+        sessions.len()
+    };
+    let sessions_created = state
+        .session_counters
+        .created
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
+    let rss_bytes = current_rss_bytes();
     info!(
-        "[{}] Session created: assetId={}",
-        session_id, body.asset_id
+        session_id,
+        asset_id = body.asset_id,
+        pending_sessions,
+        active_notarizations = state.metrics.active_notarizations(),
+        available_active_permits = state.active_notarization_permits.available_permits(),
+        sessions_created,
+        rss_bytes = rss_bytes.unwrap_or_default(),
+        rss_available = rss_bytes.is_some(),
+        "Session created"
     );
 
     // Spawn a timeout task to clean up stale sessions.
     let state_clone = state.clone();
     let session_id_clone = session_id.clone();
+    let session_ttl = session_token_ttl(state.config.notarization.timeout);
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(session_ttl).await;
         let mut sessions = state_clone.sessions.lock().await;
         if sessions.remove(&session_id_clone).is_some() {
+            let pending_sessions = sessions.len();
+            let sessions_expired = state_clone
+                .session_counters
+                .expired
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            let rss_bytes = current_rss_bytes();
             info!(
-                "[{}] Session expired (no WebSocket connection within 30s)",
-                session_id_clone
+                session_id = session_id_clone,
+                pending_sessions,
+                active_notarizations = state_clone.metrics.active_notarizations(),
+                available_active_permits = state_clone.active_notarization_permits.available_permits(),
+                session_ttl_ms = session_ttl.as_millis() as u64,
+                sessions_expired,
+                rss_bytes = rss_bytes.unwrap_or_default(),
+                rss_available = rss_bytes.is_some(),
+                "Session expired before WebSocket upgrade"
             );
         }
     });
@@ -487,21 +587,76 @@ async fn notarize_ws_handler(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = query.session_id;
 
-    // Look up and remove the session.
-    let session_data = {
+    let permit = match state
+        .active_notarization_permits
+        .clone()
+        .try_acquire_owned()
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            let pending_sessions = state.sessions.lock().await.len();
+            let rss_bytes = current_rss_bytes();
+            warn!(
+                session_id,
+                pending_sessions,
+                active_notarizations = state.metrics.active_notarizations(),
+                available_active_permits = state.active_notarization_permits.available_permits(),
+                max_active_sessions = state.config.notarization.max_active_sessions,
+                rss_bytes = rss_bytes.unwrap_or_default(),
+                rss_available = rss_bytes.is_some(),
+                "Rejected WebSocket upgrade at active MPC-TLS capacity"
+            );
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Server busy: active MPC-TLS capacity reached ({})",
+                    state.config.notarization.max_active_sessions
+                ),
+            ));
+        }
+    };
+
+    // Look up and remove the session only after securing an active-work permit.
+    let (session_data, pending_sessions) = {
         let mut sessions = state.sessions.lock().await;
-        sessions.remove(&session_id)
+        let session_data = sessions.remove(&session_id);
+        (session_data, sessions.len())
     };
 
     match session_data {
         Some(session_data) => {
-            info!("[{}] WebSocket upgrade for MPC-TLS + settlement", session_id);
+            let sessions_upgraded = state
+                .session_counters
+                .upgraded
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            let rss_bytes = current_rss_bytes();
+            info!(
+                session_id,
+                asset_id = session_data.asset_id,
+                pending_sessions,
+                active_notarizations = state.metrics.active_notarizations(),
+                available_active_permits = state.active_notarization_permits.available_permits(),
+                sessions_upgraded,
+                rss_bytes = rss_bytes.unwrap_or_default(),
+                rss_available = rss_bytes.is_some(),
+                "WebSocket upgrade for MPC-TLS + settlement"
+            );
             Ok(ws.on_upgrade(move |socket| {
-                handle_notarize_websocket(socket, session_id, session_data, state)
+                handle_notarize_websocket(socket, session_id, session_data, state, permit)
             }))
         }
         None => {
-            error!("[{}] Session not found or already used", session_id);
+            let rss_bytes = current_rss_bytes();
+            error!(
+                session_id,
+                pending_sessions,
+                active_notarizations = state.metrics.active_notarizations(),
+                available_active_permits = state.active_notarization_permits.available_permits(),
+                rss_bytes = rss_bytes.unwrap_or_default(),
+                rss_available = rss_bytes.is_some(),
+                "Session not found or already used"
+            );
             Err((
                 StatusCode::NOT_FOUND,
                 format!("Session not found: {}", session_id),
@@ -516,8 +671,23 @@ async fn handle_notarize_websocket(
     session_id: String,
     session_data: SessionData,
     state: Arc<AppState>,
+    _permit: OwnedSemaphorePermit,
 ) {
-    info!("[{}] WebSocket connected, starting MPC-TLS", session_id);
+    let started_at = Instant::now();
+    let active_notarizations = state.metrics.increment_active_notarizations();
+    let pending_sessions = state.sessions.lock().await.len();
+    let rss_bytes = current_rss_bytes();
+    info!(
+        session_id,
+        asset_id = session_data.asset_id,
+        active_notarizations,
+        pending_sessions,
+        available_active_permits = state.active_notarization_permits.available_permits(),
+        mpc_tls_timeouts = state.metrics.mpc_tls_timeouts(),
+        rss_bytes = rss_bytes.unwrap_or_default(),
+        rss_available = rss_bytes.is_some(),
+        "WebSocket connected, starting MPC-TLS"
+    );
 
     let ws_stream = WsStream::new(socket.into_inner());
 
@@ -525,51 +695,176 @@ async fn handle_notarize_websocket(
         .root_store(RootCertStore::mozilla())
         .build()
         .expect("Failed to build verifier config");
+    let runtime_limits = MpcTlsRuntimeLimits {
+        max_sent_data: state.config.notarization.max_sent_data,
+        max_recv_data: state.config.notarization.max_recv_data,
+    };
 
     let timeout_duration = Duration::from_secs(state.config.notarization.timeout);
+    let overall_deadline = TokioInstant::now() + timeout_duration;
 
-    match timeout(timeout_duration, async {
+    let mut timed_out = false;
+
+    match async {
         // Step 1: Run MPC-TLS
-        let (mpc, mut socket) = verifier::run_mpc_tls(ws_stream, verifier_config).await?;
+        let (mpc, mut socket) = match verifier::run_mpc_tls(
+            &session_id,
+            ws_stream,
+            verifier_config,
+            runtime_limits,
+            timeout_duration,
+        )
+        .await {
+            Ok(result) => result,
+            Err(MpcTlsError::Timeout { timeout }) => {
+                timed_out = true;
+                return Err(eyre::eyre!(
+                    "MPC-TLS session timed out after {}ms",
+                    timeout.as_millis()
+                ));
+            }
+            Err(MpcTlsError::Session(error)) => return Err(error),
+        };
+        let rss_bytes = current_rss_bytes();
+        info!(
+            session_id,
+            asset_id = session_data.asset_id,
+            ciphertext_sent_bytes = mpc.ciphertext_sent_bytes,
+            ciphertext_recv_bytes = mpc.ciphertext_recv_bytes,
+            plaintext_sent_bytes = mpc.sent_bytes.len(),
+            plaintext_recv_bytes = mpc.recv_bytes.len(),
+            active_notarizations = state.metrics.active_notarizations(),
+            available_active_permits = state.active_notarization_permits.available_permits(),
+            rss_bytes = rss_bytes.unwrap_or_default(),
+            rss_available = rss_bytes.is_some(),
+            "MPC-TLS stage completed"
+        );
 
         // Step 2: Read escrow from on-chain (trustless source)
-        info!("[{}] Reading escrow from chain for asset_id={}", session_id, session_data.asset_id);
+        info!(
+            session_id,
+            asset_id = session_data.asset_id,
+            "Reading escrow from chain"
+        );
         let t_chain = Instant::now();
-        let escrow = state
-            .chain_reader
-            .read_escrow(session_data.asset_id)
-            .await
-            .map_err(|e| eyre::eyre!("Chain read failed: {e}"))?;
-        info!("[{}] [TIMING] chain read: {:?}", session_id, t_chain.elapsed());
+        let chain_read_timeout = remaining_deadline(overall_deadline).ok_or_else(|| {
+            timed_out = true;
+            eyre::eyre!("Notarization deadline exceeded before chain read")
+        })?;
+        let escrow = match tokio::time::timeout(
+            chain_read_timeout,
+            state.chain_reader.read_escrow(session_data.asset_id),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| eyre::eyre!("Chain read failed: {e}"))?,
+            Err(_) => {
+                timed_out = true;
+                return Err(eyre::eyre!(
+                    "Notarization timed out during chain read after {}ms",
+                    timeout_duration.as_millis()
+                ));
+            }
+        };
+        info!(
+            session_id,
+            asset_id = session_data.asset_id,
+            stage = "chain_read",
+            duration_ms = t_chain.elapsed().as_millis() as u64,
+            "[TIMING] chain read"
+        );
 
         // Step 3: Settlement — use MPC-verified plaintext + on-chain escrow, sign EIP-712
-        info!("[{}] Running oracle settlement", session_id);
+        info!(session_id, asset_id = session_data.asset_id, "Running oracle settlement");
         let t_settle = Instant::now();
 
-        verifier::handle_post_protocol(
-            &mpc,
-            &mut socket,
-            &escrow,
-            &state.oracle_signer,
+        let settlement_timeout = remaining_deadline(overall_deadline).ok_or_else(|| {
+            timed_out = true;
+            eyre::eyre!("Notarization deadline exceeded before settlement")
+        })?;
+        match tokio::time::timeout(
+            settlement_timeout,
+            verifier::handle_post_protocol(
+                &session_id,
+                &mpc,
+                &mut socket,
+                &escrow,
+                &state.oracle_signer,
+            ),
         )
-        .await?;
-        info!("[{}] [TIMING] settlement (decide+sign+send): {:?}", session_id, t_settle.elapsed());
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                timed_out = true;
+                return Err(eyre::eyre!(
+                    "Notarization timed out during settlement after {}ms",
+                    timeout_duration.as_millis()
+                ));
+            }
+        };
+        info!(
+            session_id,
+            asset_id = session_data.asset_id,
+            stage = "settlement",
+            duration_ms = t_settle.elapsed().as_millis() as u64,
+            "[TIMING] settlement (decide+sign+send)"
+        );
 
         Ok::<(), eyre::Report>(())
-    })
+    }
     .await
     {
-        Ok(Ok(())) => {
-            info!("[{}] MPC-TLS + settlement completed successfully", session_id);
-        }
-        Ok(Err(e)) => {
-            error!("[{}] MPC-TLS + settlement failed: {}", session_id, e);
-        }
-        Err(_) => {
-            error!(
-                "[{}] MPC-TLS + settlement timed out after {:?}",
-                session_id, timeout_duration
+        Ok(()) => {
+            let remaining_active = state.metrics.decrement_active_notarizations();
+            let rss_bytes = current_rss_bytes();
+            info!(
+                session_id,
+                asset_id = session_data.asset_id,
+                total_duration_ms = started_at.elapsed().as_millis() as u64,
+                active_notarizations = remaining_active,
+                available_active_permits = state.active_notarization_permits.available_permits(),
+                mpc_tls_timeouts = state.metrics.mpc_tls_timeouts(),
+                rss_bytes = rss_bytes.unwrap_or_default(),
+                rss_available = rss_bytes.is_some(),
+                "MPC-TLS + settlement completed successfully"
             );
+        }
+        Err(error) => {
+            let timeout_count = if timed_out {
+                Some(state.metrics.record_mpc_tls_timeout())
+            } else {
+                None
+            };
+            let remaining_active = state.metrics.decrement_active_notarizations();
+            let rss_bytes = current_rss_bytes();
+            if let Some(timeout_count) = timeout_count {
+                error!(
+                    session_id,
+                    asset_id = session_data.asset_id,
+                    timeout_ms = timeout_duration.as_millis() as u64,
+                    total_duration_ms = started_at.elapsed().as_millis() as u64,
+                    active_notarizations = remaining_active,
+                    available_active_permits = state.active_notarization_permits.available_permits(),
+                    mpc_tls_timeouts = timeout_count,
+                    rss_bytes = rss_bytes.unwrap_or_default(),
+                    rss_available = rss_bytes.is_some(),
+                    "MPC-TLS + settlement timed out"
+                );
+            } else {
+                error!(
+                    session_id,
+                    asset_id = session_data.asset_id,
+                    total_duration_ms = started_at.elapsed().as_millis() as u64,
+                    active_notarizations = remaining_active,
+                    available_active_permits = state.active_notarization_permits.available_permits(),
+                    mpc_tls_timeouts = state.metrics.mpc_tls_timeouts(),
+                    rss_bytes = rss_bytes.unwrap_or_default(),
+                    rss_available = rss_bytes.is_some(),
+                    error = %error,
+                    "MPC-TLS + settlement failed"
+                );
+            }
         }
     }
 }
