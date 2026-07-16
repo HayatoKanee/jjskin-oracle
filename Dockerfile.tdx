@@ -12,11 +12,11 @@
 #
 # Secrets (bots.json) are mounted at runtime, NEVER baked into the image.
 #
-# To update base images: docker pull rust:bookworm && docker inspect --format='{{index .RepoDigests 0}}' rust:bookworm
+# To update base images: docker pull rust:1.95.0-bookworm && docker inspect --format='{{index .RepoDigests 0}}' rust:1.95.0-bookworm
 
 # --- Pinned base images (update digests when upgrading) ---
-# rust:bookworm (2026-02-26)
-FROM rust@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS builder
+# rust:1.95.0-bookworm, linux/amd64 (2026-04-22)
+FROM rust@sha256:adab7941580c74513aa3347f2d2a1f975498280743d29ec62978ba12e3540d3a AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY buy-order-attestation-catalog.json ./

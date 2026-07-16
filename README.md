@@ -2,7 +2,7 @@
 
 TDX oracle for the [JJSKIN](https://jjskin.com) CS2 skin marketplace. Runs MPC-TLS verification and settlement decisions inside an Intel TDX confidential VM, so neither the operator nor the hosting provider can tamper with trade outcomes.
 
-Built on [TLSNotary](https://github.com/tlsnotary/tlsn) `v0.1.0-alpha.14` and deployed via [dstack](https://github.com/aspect-build/dstack) (Phala Network).
+Built on [TLSNotary](https://github.com/tlsnotary/tlsn) `v0.1.0-alpha.15` and deployed via [dstack](https://github.com/aspect-build/dstack) (Phala Network).
 
 **Live deployment**: `https://3f351d27b464ed7779351cae4b7c548b0ee648c7-7047.dstack-pha-prod5.phala.network`
 
@@ -51,8 +51,9 @@ src/
 | GET | `/health` | Health check (`"ok"`) |
 | GET | `/info` | Version, oracle address, TDX status |
 | GET | `/attestation` | Fresh TDX DCAP quote (binary) |
-| POST | `/session` | Create MPC-TLS session (requires `assetId` query param) |
-| GET | `/notarize` | WebSocket MPC-TLS session |
+| POST | `/session` | Create an alpha.15 MPC-TLS session for a decimal-string `assetId` |
+| GET | `/notarize` | Claim the session once and run the MPC-TLS verifier over WebSocket |
+| GET | `/session/result` | Block for and consume the one-time signed settlement result |
 | GET | `/proxy` | WebSocket-to-TCP proxy for browser provers |
 | POST | `/inventory/attest` | Inventory-backed `ItemAttestation(assetId,itemDetail)` signing |
 

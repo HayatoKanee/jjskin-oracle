@@ -2,16 +2,15 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use eyre::{Result, eyre};
-use futures_util::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
+use futures_util::io::{AsyncRead, AsyncWrite};
 use tokio::{task::JoinHandle, time::timeout};
 use tracing::{info, warn};
 
 use tlsn::{
-    config::tls_commit::{TlsCommitProtocolConfig, TlsCommitRequest},
     config::verifier::VerifierConfig,
     connection::ServerName,
     transcript::ContentType,
-    verifier::VerifierOutput,
+    verifier::{VerifierCommitStart, VerifierOutput},
     Session,
 };
 
@@ -65,14 +64,14 @@ const DRIVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 // Step 1: Run MPC-TLS Protocol
 // ============================================================================
 
-/// Run MPC-TLS, extract plaintext, return result + reclaimed socket.
+/// Run alpha.15 MPC-TLS, verify the reveal request, and extract authenticated plaintext.
 pub async fn run_mpc_tls<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     session_id: &str,
     socket: S,
     verifier_config: VerifierConfig,
     limits: MpcTlsRuntimeLimits,
     timeout_duration: Duration,
-) -> std::result::Result<(MpcTlsResult, S), MpcTlsError> {
+) -> std::result::Result<MpcTlsResult, MpcTlsError> {
     info!(session_id, "Starting MPC-TLS session");
 
     let session = Session::new(socket);
@@ -94,27 +93,44 @@ pub async fn run_mpc_tls<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
             .map_err(|e| eyre!("Commitment failed: {}", e))?;
         info!(session_id, stage = "commit", duration_ms = t0.elapsed().as_millis() as u64, "[TIMING] commit (OT setup)");
 
-        if let Some(reject_reason) = validate_commit_request(verifier.request(), limits) {
-            info!(
-                session_id,
-                max_sent_data = limits.max_sent_data,
-                max_recv_data = limits.max_recv_data,
-                reject_reason = reject_reason.as_str(),
-                "Rejecting prover commit request that exceeds runtime limits"
-            );
-            verifier
-                .reject(Some(&reject_reason))
-                .await
-                .map_err(|e| eyre!("Failed to reject oversized commitment request: {}", e))?;
-            return Err(eyre!("Commitment request rejected: {reject_reason}"));
-        }
-
-        // Step 2: Accept (prover ready)
+        // Alpha.15 exposes the proposed protocol as a typed enum. Reject proxy
+        // mode and oversized MPC configurations before allocating protocol work.
         let t1 = Instant::now();
-        let verifier = verifier
-            .accept()
-            .await
-            .map_err(|e| eyre!("Accept failed: {}", e))?;
+        let verifier = match verifier {
+            VerifierCommitStart::Mpc(verifier) => {
+                let config = verifier.config();
+                if let Some(reject_reason) = validate_mpc_limits(
+                    config.max_sent_data(),
+                    config.max_recv_data(),
+                    limits,
+                ) {
+                    info!(
+                        session_id,
+                        max_sent_data = limits.max_sent_data,
+                        max_recv_data = limits.max_recv_data,
+                        reject_reason = reject_reason.as_str(),
+                        "Rejecting prover commit request that exceeds runtime limits"
+                    );
+                    verifier
+                        .reject(Some(&reject_reason))
+                        .await
+                        .map_err(|e| eyre!("Failed to reject commitment request: {}", e))?;
+                    return Err(eyre!("Commitment request rejected: {reject_reason}"));
+                }
+
+                verifier
+                    .accept()
+                    .await
+                    .map_err(|e| eyre!("Accept failed: {}", e))?
+            }
+            VerifierCommitStart::Proxy(verifier) => {
+                verifier
+                    .reject(Some("expecting to use MPC-TLS"))
+                    .await
+                    .map_err(|e| eyre!("Failed to reject proxy mode: {}", e))?;
+                return Err(eyre!("Commitment request rejected: expecting to use MPC-TLS"));
+            }
+        };
         info!(session_id, stage = "accept", duration_ms = t1.elapsed().as_millis() as u64, "[TIMING] accept");
 
         // Step 3: Run MPC-TLS (garbled circuits over TLS)
@@ -134,6 +150,19 @@ pub async fn run_mpc_tls<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
             .await
             .map_err(|e| eyre!("Verification failed: {}", e))?;
         info!(session_id, stage = "verify", duration_ms = t3.elapsed().as_millis() as u64, "[TIMING] verify");
+
+        let request = verifier.request();
+        if !request.server_identity() || request.reveal().is_none() {
+            let verifier = verifier
+                .reject(Some("expected server identity and transcript reveal"))
+                .await
+                .map_err(|e| eyre!("Failed to reject incomplete reveal: {}", e))?;
+            verifier
+                .close()
+                .await
+                .map_err(|e| eyre!("Failed to close rejected verifier: {}", e))?;
+            return Err(eyre!("Prover did not reveal server identity and transcript data"));
+        }
 
         // Step 5: Accept verification output
         let t4 = Instant::now();
@@ -210,11 +239,11 @@ pub async fn run_mpc_tls<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
         Ok(Ok(result)) => {
             let t_close = Instant::now();
             handle.close();
-            let socket = reclaim_socket_after_close(session_id, &mut driver_task)
+            finish_driver_after_close(session_id, &mut driver_task)
                 .await
                 .map_err(MpcTlsError::Session)?;
-            info!(session_id, stage = "close", duration_ms = t_close.elapsed().as_millis() as u64, "[TIMING] close + reclaim socket");
-            Ok((result, socket))
+            info!(session_id, stage = "close", duration_ms = t_close.elapsed().as_millis() as u64, "[TIMING] close session");
+            Ok(result)
         }
         Ok(Err(error)) => {
             handle.close();
@@ -231,17 +260,20 @@ pub async fn run_mpc_tls<S: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     }
 }
 
-async fn reclaim_socket_after_close<S, E>(
+async fn finish_driver_after_close<S, E>(
     session_id: &str,
     driver_task: &mut JoinHandle<std::result::Result<S, E>>,
-) -> Result<S>
+) -> Result<()>
 where
     E: fmt::Display,
 {
     match timeout(DRIVER_SHUTDOWN_GRACE, &mut *driver_task).await {
-        Ok(joined) => joined
-            .map_err(|e| eyre!("Driver task failed: {}", e))?
-            .map_err(|e| eyre!("Session driver error: {}", e)),
+        Ok(joined) => {
+            joined
+                .map_err(|e| eyre!("Driver task failed: {}", e))?
+                .map_err(|e| eyre!("Session driver error: {}", e))?;
+            Ok(())
+        }
         Err(_) => {
             warn!(
                 session_id,
@@ -286,26 +318,23 @@ async fn teardown_failed_session<S, E>(
     }
 }
 
-fn validate_commit_request(
-    request: &TlsCommitRequest,
+fn validate_mpc_limits(
+    requested_max_sent_data: usize,
+    requested_max_recv_data: usize,
     limits: MpcTlsRuntimeLimits,
 ) -> Option<String> {
-    let TlsCommitProtocolConfig::Mpc(mpc_tls_config) = request.protocol() else {
-        return Some("expecting to use MPC-TLS".to_string());
-    };
-
-    if mpc_tls_config.max_sent_data() > limits.max_sent_data {
+    if requested_max_sent_data > limits.max_sent_data {
         return Some(format!(
             "max_sent_data is too large (requested {}, allowed {})",
-            mpc_tls_config.max_sent_data(),
+            requested_max_sent_data,
             limits.max_sent_data
         ));
     }
 
-    if mpc_tls_config.max_recv_data() > limits.max_recv_data {
+    if requested_max_recv_data > limits.max_recv_data {
         return Some(format!(
             "max_recv_data is too large (requested {}, allowed {})",
-            mpc_tls_config.max_recv_data(),
+            requested_max_recv_data,
             limits.max_recv_data
         ));
     }
@@ -316,55 +345,37 @@ fn validate_commit_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tlsn::config::tls_commit::{TlsCommitConfig, mpc::MpcTlsConfig};
-
-    fn request_with_limits(max_sent_data: usize, max_recv_data: usize) -> TlsCommitRequest {
-        TlsCommitConfig::builder()
-            .protocol(
-                MpcTlsConfig::builder()
-                    .max_sent_data(max_sent_data)
-                    .max_recv_data(max_recv_data)
-                    .build()
-                    .unwrap(),
-            )
-            .build()
-            .unwrap()
-            .to_request()
-    }
 
     #[test]
     fn accepts_commit_request_within_runtime_limits() {
-        let request = request_with_limits(1024, 2048);
         let limits = MpcTlsRuntimeLimits {
             max_sent_data: 1024,
             max_recv_data: 2048,
         };
 
-        assert!(validate_commit_request(&request, limits).is_none());
+        assert!(validate_mpc_limits(1024, 2048, limits).is_none());
     }
 
     #[test]
     fn rejects_commit_request_when_sent_limit_is_too_large() {
-        let request = request_with_limits(2048, 2048);
         let limits = MpcTlsRuntimeLimits {
             max_sent_data: 1024,
             max_recv_data: 2048,
         };
 
-        let rejection = validate_commit_request(&request, limits)
+        let rejection = validate_mpc_limits(2048, 2048, limits)
             .expect("expected request to be rejected");
         assert!(rejection.contains("max_sent_data"));
     }
 
     #[test]
     fn rejects_commit_request_when_recv_limit_is_too_large() {
-        let request = request_with_limits(1024, 4096);
         let limits = MpcTlsRuntimeLimits {
             max_sent_data: 1024,
             max_recv_data: 2048,
         };
 
-        let rejection = validate_commit_request(&request, limits)
+        let rejection = validate_mpc_limits(1024, 4096, limits)
             .expect("expected request to be rejected");
         assert!(rejection.contains("max_recv_data"));
     }
@@ -374,19 +385,14 @@ mod tests {
 // Step 2: Post-MPC Settlement (single verifier path)
 // ============================================================================
 
-/// Handle post-MPC settlement: decide using MPC-verified plaintext, sign EIP-712.
-///
-/// Wire protocol (server → prover only):
-///   result_len(u64) | bincode(SettlementResult)
-///
-/// The prover sends nothing — the server already has MPC-verified plaintext.
-pub async fn handle_post_protocol<S: AsyncRead + AsyncWrite + Unpin>(
+/// Create a settlement result from MPC-verified plaintext and on-chain escrow.
+/// The HTTP session-result route transports it after the alpha.15 verifier closes.
+pub async fn create_settlement_result(
     session_id: &str,
     mpc: &MpcTlsResult,
-    socket: &mut S,
     escrow: &EscrowSnapshot,
     signer: &OracleSigner,
-) -> Result<()> {
+) -> Result<SettlementResult> {
     // Use MPC-verified plaintext directly (NOT prover-sent data)
     let server_name_str = mpc
         .server_name
@@ -441,29 +447,11 @@ pub async fn handle_post_protocol<S: AsyncRead + AsyncWrite + Unpin>(
         refund_reason: settlement.refund_reason as u8,
     };
 
-    let result_bytes =
-        bincode::serialize(&wire_result).map_err(|e| eyre!("Failed to serialize result: {e}"))?;
-
-    // Send: result_len(u64) | result_bytes
-    socket
-        .write_all(&(result_bytes.len() as u64).to_le_bytes())
-        .await
-        .map_err(|e| eyre!("Failed to send result length: {e}"))?;
-    socket
-        .write_all(&result_bytes)
-        .await
-        .map_err(|e| eyre!("Failed to send result: {e}"))?;
-    socket
-        .flush()
-        .await
-        .map_err(|e| eyre!("Failed to flush: {e}"))?;
-
     info!(
-        "Settlement result sent ({} bytes): asset_id={}, decision={:?}",
-        result_bytes.len(),
+        "Settlement result ready: asset_id={}, decision={:?}",
         settlement.asset_id,
         settlement.decision
     );
 
-    Ok(())
+    Ok(wire_result)
 }

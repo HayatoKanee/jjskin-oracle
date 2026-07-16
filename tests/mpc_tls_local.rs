@@ -17,12 +17,10 @@ use tlsn::{
         prove::ProveConfig,
         prover::ProverConfig,
         tls::TlsClientConfig,
-        tls_commit::{TlsCommitConfig, mpc::MpcTlsConfig},
+        tls_commit::mpc::MpcTlsConfig,
         verifier::VerifierConfig,
     },
     connection::ServerName,
-    transcript::{Direction, TranscriptCommitConfig, TranscriptCommitmentKind},
-    hash::HashAlgId,
     webpki::{CertificateDer, RootCertStore},
 };
 use tlsn_server::{
@@ -138,8 +136,7 @@ async fn run_mpc_tls_flow_with_host(
             .unwrap();
 
         // Run the real MPC-TLS verifier protocol
-        let (mpc_result, mut socket) =
-            verifier::run_mpc_tls(
+        let mpc_result = verifier::run_mpc_tls(
                 TEST_SESSION_ID,
                 verifier_socket.compat(),
                 verifier_config,
@@ -150,15 +147,14 @@ async fn run_mpc_tls_flow_with_host(
                 .expect("run_mpc_tls failed");
 
         // Run the real settlement decision + EIP-712 signing
-        verifier::handle_post_protocol(
+        verifier::create_settlement_result(
             TEST_SESSION_ID,
             &mpc_result,
-            &mut socket,
             &escrow_clone,
             &verifier_signer,
         )
         .await
-        .expect("handle_post_protocol failed");
+        .expect("create_settlement_result failed")
     });
 
     // 4. Run prover side
@@ -185,16 +181,11 @@ async fn run_mpc_tls_flow_with_host(
     // 4b. MPC-TLS commit
     let prover = prover
         .commit(
-            TlsCommitConfig::builder()
-                .protocol(
-                    MpcTlsConfig::builder()
-                        .max_sent_data(MAX_SENT_DATA)
-                        .max_sent_records(MAX_SENT_RECORDS)
-                        .max_recv_data(MAX_RECV_DATA)
-                        .max_recv_records_online(MAX_RECV_RECORDS)
-                        .build()
-                        .unwrap(),
-                )
+            MpcTlsConfig::builder()
+                .max_sent_data(MAX_SENT_DATA)
+                .max_sent_records(MAX_SENT_RECORDS)
+                .max_recv_data(MAX_RECV_DATA)
+                .max_recv_records_online(MAX_RECV_RECORDS)
                 .build()
                 .unwrap(),
         )
@@ -213,9 +204,8 @@ async fn run_mpc_tls_flow_with_host(
                 .unwrap(),
             client_socket.compat(),
         )
-        .await
         .unwrap();
-    let prover_task = tokio::spawn(prover_fut);
+    let prover_task = tokio::spawn(prover_fut.into_future());
 
     // 4d. Send HTTP request to mock Steam through MPC-TLS
     tls_conn
@@ -233,46 +223,22 @@ async fn run_mpc_tls_flow_with_host(
     let sent_len = prover.transcript().sent().len();
     let recv_len = prover.transcript().received().len();
 
-    // Commit transcript ranges
-    let mut commit_builder = TranscriptCommitConfig::builder(prover.transcript());
-    let kind = TranscriptCommitmentKind::Hash {
-        alg: HashAlgId::SHA256,
-    };
-    commit_builder
-        .commit_with_kind(&(0..sent_len), Direction::Sent, kind)
-        .unwrap();
-    commit_builder
-        .commit_with_kind(&(0..recv_len), Direction::Received, kind)
-        .unwrap();
-
     let mut prove_builder = ProveConfig::builder(prover.transcript());
     prove_builder.server_identity();
     prove_builder.reveal_sent(&(0..sent_len)).unwrap();
     prove_builder.reveal_recv(&(0..recv_len)).unwrap();
-    prove_builder.transcript_commit(commit_builder.build().unwrap());
 
     let config = prove_builder.build().unwrap();
     prover.prove(&config).await.unwrap();
     prover.close().await.unwrap();
 
-    // 4f. Close session and reclaim socket
+    // 4f. Close the alpha.15 session. Settlement is delivered through the
+    // oracle's separate one-time result channel in production.
     handle.close();
-    let mut socket = driver_task.await.unwrap().unwrap();
-
-    // 4g. Read settlement result from wire protocol
-    // Wire format: u64 LE length + bincode(SettlementResult)
-    let mut len_buf = [0u8; 8];
-    socket.read_exact(&mut len_buf).await.unwrap();
-    let result_len = u64::from_le_bytes(len_buf) as usize;
-
-    let mut result_bytes = vec![0u8; result_len];
-    socket.read_exact(&mut result_bytes).await.unwrap();
-
-    let settlement: SettlementResult =
-        bincode::deserialize(&result_bytes).expect("Failed to deserialize SettlementResult");
+    driver_task.await.unwrap().unwrap();
 
     // Wait for verifier to complete
-    verifier_task.await.unwrap();
+    let settlement = verifier_task.await.unwrap();
 
     MpcTlsTestResult { settlement }
 }
@@ -510,7 +476,7 @@ async fn test_mpc_tls_wrong_ca_rejected() {
     let _verifier_signer = create_test_signer().await;
     let _escrow_clone = escrow.clone();
 
-    let verifier_task = tokio::spawn(async move {
+    let mut verifier_task = tokio::spawn(async move {
         let verifier_config = VerifierConfig::builder()
             .root_store(RootCertStore {
                 roots: vec![CertificateDer(verifier_ca)],
@@ -547,16 +513,11 @@ async fn test_mpc_tls_wrong_ca_rejected() {
 
     let prover = prover
         .commit(
-            TlsCommitConfig::builder()
-                .protocol(
-                    MpcTlsConfig::builder()
-                        .max_sent_data(MAX_SENT_DATA)
-                        .max_sent_records(MAX_SENT_RECORDS)
-                        .max_recv_data(MAX_RECV_DATA)
-                        .max_recv_records_online(MAX_RECV_RECORDS)
-                        .build()
-                        .unwrap(),
-                )
+            MpcTlsConfig::builder()
+                .max_sent_data(MAX_SENT_DATA)
+                .max_sent_records(MAX_SENT_RECORDS)
+                .max_recv_data(MAX_RECV_DATA)
+                .max_recv_records_online(MAX_RECV_RECORDS)
                 .build()
                 .unwrap(),
         )
@@ -574,8 +535,7 @@ async fn test_mpc_tls_wrong_ca_rejected() {
                 .build()
                 .unwrap(),
             client_socket.compat(),
-        )
-        .await;
+        );
 
     // The TLS handshake should fail because the server cert (signed by CA-A)
     // is not trusted by the prover (which only trusts CA-B).
@@ -589,7 +549,7 @@ async fn test_mpc_tls_wrong_ca_rejected() {
             connect_failed = true;
         }
         Ok((mut tls_conn, prover_fut)) => {
-            let prover_task = tokio::spawn(prover_fut);
+            let prover_task = tokio::spawn(prover_fut.into_future());
 
             // Try to send data — should fail during MPC-TLS
             let write_result = tls_conn
@@ -620,15 +580,35 @@ async fn test_mpc_tls_wrong_ca_rejected() {
 
     handle.close();
 
-    let verifier_result = verifier_task.await.unwrap();
-    let verifier_failed = verifier_result.is_err();
-    if let Err(e) = &verifier_result {
-        eprintln!("[test] Verifier correctly failed: {e:?}");
-    }
+    // The prover-side rejection is the security property under test. Give the
+    // verifier a short grace period to observe the closed session, then abort
+    // the test task instead of waiting for the production protocol deadline.
+    let verifier_failed = match tokio::time::timeout(
+        Duration::from_secs(5),
+        &mut verifier_task,
+    )
+    .await
+    {
+        Ok(Ok(result)) => {
+            if let Err(error) = &result {
+                eprintln!("[test] Verifier also failed: {error:?}");
+            }
+            result.is_err()
+        }
+        Ok(Err(join_error)) => {
+            eprintln!("[test] Verifier task failed to join: {join_error}");
+            true
+        }
+        Err(_) => {
+            verifier_task.abort();
+            let _ = verifier_task.await;
+            false
+        }
+    };
 
     assert!(
-        connect_failed || prover_failed || verifier_failed,
-        "MPC-TLS flow must fail when prover trusts wrong CA. \
+        connect_failed || prover_failed,
+        "The prover must reject MPC-TLS when it trusts the wrong CA. \
          connect_failed={connect_failed}, prover_failed={prover_failed}, verifier_failed={verifier_failed}"
     );
 }

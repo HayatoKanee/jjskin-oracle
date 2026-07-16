@@ -12,7 +12,7 @@ mod verifier;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -26,7 +26,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use axum_websocket::{WebSocket, WebSocketUpgrade};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
@@ -47,9 +47,16 @@ use verifier::{MpcTlsError, MpcTlsRuntimeLimits};
 // Application State
 // ============================================================================
 
-/// Stored session data.
+const TLSN_PROTOCOL_VERSION: &str = "tlsn/0.1.0-alpha.15";
+
+type SettlementOutcome = Result<settlement::SettlementResult, String>;
+
+/// Stored one-time session data shared by the verifier and result endpoint.
 struct SessionData {
     asset_id: u64,
+    verifier_claimed: AtomicBool,
+    result_sender: Mutex<Option<oneshot::Sender<SettlementOutcome>>>,
+    result_receiver: Mutex<Option<oneshot::Receiver<SettlementOutcome>>>,
 }
 
 #[derive(Default)]
@@ -124,7 +131,7 @@ fn spawn_resource_heartbeat(state: Arc<AppState>) {
 
 /// Shared application state.
 struct AppState {
-    sessions: Mutex<HashMap<String, SessionData>>,
+    sessions: Mutex<HashMap<String, Arc<SessionData>>>,
     config: Config,
     oracle_signer: Arc<OracleSigner>,
     chain_reader: ChainReader,
@@ -174,6 +181,12 @@ struct SessionRequest {
     /// Accepts both string and number to avoid JS precision loss for large IDs.
     #[serde(rename = "assetId", deserialize_with = "deserialize_string_or_number")]
     asset_id: u64,
+    #[serde(rename = "maxSentData")]
+    max_sent_data: usize,
+    #[serde(rename = "maxRecvData")]
+    max_recv_data: usize,
+    #[serde(rename = "protocolVersion")]
+    protocol_version: String,
 }
 
 /// Deserialize a u64 from either a JSON string ("123") or number (123).
@@ -201,11 +214,39 @@ where
 struct SessionResponse {
     #[serde(rename = "sessionId")]
     session_id: String,
+    #[serde(rename = "protocolVersion")]
+    protocol_version: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct SettlementResultResponse {
+    signature: String,
+    #[serde(rename = "assetId")]
+    asset_id: String,
+    decision: u8,
+    #[serde(rename = "refundReason")]
+    refund_reason: u8,
+    #[serde(rename = "protocolVersion")]
+    protocol_version: &'static str,
+}
+
+impl From<settlement::SettlementResult> for SettlementResultResponse {
+    fn from(result: settlement::SettlementResult) -> Self {
+        Self {
+            signature: format!("0x{}", hex::encode(result.signature)),
+            asset_id: result.asset_id.to_string(),
+            decision: result.decision,
+            refund_reason: result.refund_reason,
+            protocol_version: TLSN_PROTOCOL_VERSION,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct InfoResponse {
     version: &'static str,
+    #[serde(rename = "protocolVersion")]
+    protocol_version: &'static str,
     #[serde(rename = "gitHash")]
     git_hash: String,
     #[serde(rename = "oracleAddress")]
@@ -218,6 +259,12 @@ struct InfoResponse {
 
 #[derive(Debug, Deserialize)]
 struct NotarizeQuery {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionResultQuery {
     #[serde(rename = "sessionId")]
     session_id: String,
 }
@@ -412,6 +459,7 @@ async fn run_serve(config_path: &str) -> eyre::Result<()> {
         .route("/info", get(info_handler))
         .route("/attestation", get(attestation::attestation_handler))
         .route("/session", post(session_handler))
+        .route("/session/result", get(session_result_handler))
         .route("/notarize", get(notarize_ws_handler))
         .route("/proxy", get(proxy::proxy_ws_handler))
         .nest("/inventory", inventory_attestation_routes)
@@ -429,6 +477,7 @@ async fn run_serve(config_path: &str) -> eyre::Result<()> {
     info!("  GET  /info                - Server info + oracle address");
     info!("  GET  /attestation         - TDX DCAP quote (for oracle registration)");
     info!("  POST /session             - Create session (assetId required)");
+    info!("  GET  /session/result      - Consume one-time settlement result");
     info!("  GET  /notarize?sessionId= - WebSocket MPC-TLS + settlement");
     info!("  GET  /proxy?token=        - WebSocket-to-TCP proxy");
     info!("  POST /inventory/attest    - Inventory-backed item attestation");
@@ -472,6 +521,7 @@ async fn info_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     Json(InfoResponse {
         version: env!("CARGO_PKG_VERSION"),
+        protocol_version: TLSN_PROTOCOL_VERSION,
         git_hash,
         oracle_address: format!("{}", state.oracle_signer.address()),
         tdx_enabled: tdx_available,
@@ -491,8 +541,41 @@ async fn session_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if body.protocol_version != TLSN_PROTOCOL_VERSION {
+        return Err((
+            StatusCode::UPGRADE_REQUIRED,
+            format!(
+                "TLSNotary protocol mismatch: expected {}, received {}",
+                TLSN_PROTOCOL_VERSION, body.protocol_version
+            ),
+        ));
+    }
+    if body.max_sent_data == 0
+        || body.max_recv_data == 0
+        || body.max_sent_data > state.config.notarization.max_sent_data
+        || body.max_recv_data > state.config.notarization.max_recv_data
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Invalid transcript limits: sent={}/{}, recv={}/{}",
+                body.max_sent_data,
+                state.config.notarization.max_sent_data,
+                body.max_recv_data,
+                state.config.notarization.max_recv_data,
+            ),
+        ));
+    }
+
     // Atomic check-and-insert under a single lock to prevent TOCTOU race.
     let session_id = Uuid::new_v4().to_string();
+    let (result_sender, result_receiver) = oneshot::channel();
+    let session_data = Arc::new(SessionData {
+        asset_id: body.asset_id,
+        verifier_claimed: AtomicBool::new(false),
+        result_sender: Mutex::new(Some(result_sender)),
+        result_receiver: Mutex::new(Some(result_receiver)),
+    });
     let pending_sessions = {
         let mut sessions = state.sessions.lock().await;
         if sessions.len() >= state.config.notarization.max_pending_sessions {
@@ -521,12 +604,7 @@ async fn session_handler(
                 ),
             ));
         }
-        sessions.insert(
-            session_id.clone(),
-            SessionData {
-                asset_id: body.asset_id,
-            },
-        );
+        sessions.insert(session_id.clone(), session_data);
         sessions.len()
     };
     let sessions_created = state
@@ -576,7 +654,59 @@ async fn session_handler(
         }
     });
 
-    Ok(Json(SessionResponse { session_id }))
+    Ok(Json(SessionResponse {
+        session_id,
+        protocol_version: TLSN_PROTOCOL_VERSION,
+    }))
+}
+
+/// GET /session/result?sessionId=xxx — consume a one-time settlement result.
+async fn session_result_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionResultQuery>,
+) -> Result<Json<SettlementResultResponse>, (StatusCode, String)> {
+    let session_data = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&query.session_id).cloned()
+    }
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Session not found: {}", query.session_id),
+        )
+    })?;
+
+    let receiver = session_data
+        .result_receiver
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                format!("Session result already claimed: {}", query.session_id),
+            )
+        })?;
+
+    let wait_timeout = Duration::from_secs(state.config.notarization.timeout);
+    let outcome = tokio::time::timeout(wait_timeout, receiver).await;
+    state.sessions.lock().await.remove(&query.session_id);
+
+    match outcome {
+        Ok(Ok(Ok(settlement))) => Ok(Json(settlement.into())),
+        Ok(Ok(Err(error))) => Err((StatusCode::UNPROCESSABLE_ENTITY, error)),
+        Ok(Err(_)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Settlement result channel closed unexpectedly".to_string(),
+        )),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "Settlement result timed out after {}ms",
+                wait_timeout.as_millis()
+            ),
+        )),
+    }
 }
 
 /// GET /notarize?sessionId=xxx — WebSocket upgrade for MPC-TLS + settlement.
@@ -616,15 +746,27 @@ async fn notarize_ws_handler(
         }
     };
 
-    // Look up and remove the session only after securing an active-work permit.
+    // Look up the session only after securing an active-work permit. It stays in
+    // the map until the result endpoint consumes it or the TTL expires.
     let (session_data, pending_sessions) = {
-        let mut sessions = state.sessions.lock().await;
-        let session_data = sessions.remove(&session_id);
+        let sessions = state.sessions.lock().await;
+        let session_data = sessions.get(&session_id).cloned();
         (session_data, sessions.len())
     };
 
     match session_data {
         Some(session_data) => {
+            if session_data
+                .verifier_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("Session verifier already claimed: {}", session_id),
+                ));
+            }
+
             let sessions_upgraded = state
                 .session_counters
                 .upgraded
@@ -669,7 +811,7 @@ async fn notarize_ws_handler(
 async fn handle_notarize_websocket(
     socket: WebSocket,
     session_id: String,
-    session_data: SessionData,
+    session_data: Arc<SessionData>,
     state: Arc<AppState>,
     _permit: OwnedSemaphorePermit,
 ) {
@@ -707,7 +849,7 @@ async fn handle_notarize_websocket(
 
     match async {
         // Step 1: Run MPC-TLS
-        let (mpc, mut socket) = match verifier::run_mpc_tls(
+        let mpc = match verifier::run_mpc_tls(
             &session_id,
             ws_stream,
             verifier_config,
@@ -782,12 +924,11 @@ async fn handle_notarize_websocket(
             timed_out = true;
             eyre::eyre!("Notarization deadline exceeded before settlement")
         })?;
-        match tokio::time::timeout(
+        let settlement = match tokio::time::timeout(
             settlement_timeout,
-            verifier::handle_post_protocol(
+            verifier::create_settlement_result(
                 &session_id,
                 &mpc,
-                &mut socket,
                 &escrow,
                 &state.oracle_signer,
             ),
@@ -811,11 +952,11 @@ async fn handle_notarize_websocket(
             "[TIMING] settlement (decide+sign+send)"
         );
 
-        Ok::<(), eyre::Report>(())
+        Ok::<settlement::SettlementResult, eyre::Report>(settlement)
     }
     .await
     {
-        Ok(()) => {
+        Ok(settlement) => {
             let remaining_active = state.metrics.decrement_active_notarizations();
             let rss_bytes = current_rss_bytes();
             info!(
@@ -829,6 +970,7 @@ async fn handle_notarize_websocket(
                 rss_available = rss_bytes.is_some(),
                 "MPC-TLS + settlement completed successfully"
             );
+            publish_settlement_outcome(&session_data, Ok(settlement)).await;
         }
         Err(error) => {
             let timeout_count = if timed_out {
@@ -865,6 +1007,81 @@ async fn handle_notarize_websocket(
                     "MPC-TLS + settlement failed"
                 );
             }
+            publish_settlement_outcome(&session_data, Err(error.to_string())).await;
         }
+    }
+}
+
+async fn publish_settlement_outcome(
+    session_data: &SessionData,
+    outcome: SettlementOutcome,
+) {
+    if let Some(sender) = session_data.result_sender.lock().await.take() {
+        let _ = sender.send(outcome);
+    }
+}
+
+#[cfg(test)]
+mod alpha15_session_tests {
+    use super::*;
+
+    fn session_data(asset_id: u64) -> (Arc<SessionData>, oneshot::Receiver<SettlementOutcome>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Arc::new(SessionData {
+                asset_id,
+                verifier_claimed: AtomicBool::new(false),
+                result_sender: Mutex::new(Some(sender)),
+                result_receiver: Mutex::new(None),
+            }),
+            receiver,
+        )
+    }
+
+    #[test]
+    fn session_request_requires_exact_alpha15_protocol_and_preserves_uint64_asset() {
+        let request: SessionRequest = serde_json::from_value(serde_json::json!({
+            "assetId": "18446744073709551615",
+            "maxSentData": 1024,
+            "maxRecvData": 2048,
+            "protocolVersion": TLSN_PROTOCOL_VERSION,
+        }))
+        .unwrap();
+
+        assert_eq!(request.asset_id, u64::MAX);
+        assert_eq!(request.protocol_version, TLSN_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn settlement_response_serializes_asset_as_string_and_signature_as_hex() {
+        let response = SettlementResultResponse::from(settlement::SettlementResult {
+            signature: vec![0xab; 65],
+            asset_id: u64::MAX,
+            decision: 1,
+            refund_reason: 12,
+        });
+        let json = serde_json::to_value(response).unwrap();
+
+        assert_eq!(json["assetId"], u64::MAX.to_string());
+        assert_eq!(json["signature"], format!("0x{}", "ab".repeat(65)));
+        assert_eq!(json["protocolVersion"], TLSN_PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn settlement_result_is_published_only_once() {
+        let (session, receiver) = session_data(42);
+        let first = settlement::SettlementResult {
+            signature: vec![1; 65],
+            asset_id: 42,
+            decision: 0,
+            refund_reason: 0,
+        };
+
+        publish_settlement_outcome(&session, Ok(first.clone())).await;
+        publish_settlement_outcome(&session, Err("duplicate".to_string())).await;
+
+        let received = receiver.await.unwrap().unwrap();
+        assert_eq!(received.asset_id, first.asset_id);
+        assert!(session.result_sender.lock().await.is_none());
     }
 }
